@@ -1,0 +1,33 @@
+# Build outputs -------------------------------------------------------------
+# Both application Makefiles compile into ./build and link straight into bin/,
+# so nothing buildable is written next to the sources.  The loose patterns
+# below stay as a backstop for a hand-run gcc.
+build/
+*.o
+*.res
+*.elf
+*.map
+programmer_cli.exe
+programmer_gui.exe
+blue-pill-firmware/firmware.bin
+blue-pill-firmware/firmware.hex
+
+# bin/ is deliberately tracked: it holds the released binaries, so the exe
+# patterns above are re-included here.
+!bin/programmer_cli.exe
+!bin/programmer_gui.exe
+
+# Device images ---------------------------------------------------------------
+# Flash dumps contain per-device data: Zigbee network keys, pairing state and
+# energy calibration.  Keep them out of the repository.
+*.bin
+!bin/blue-pill-firmware.bin
+dumps/
+
+# Editor / OS ------------------------------------------------------------------
+*.swp
+*~
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/

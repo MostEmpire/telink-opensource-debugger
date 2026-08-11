@@ -1,0 +1,22 @@
+# Normalise text to LF in the repository, so the sources look the same on every
+# platform, while keeping the file types that Windows tools require as CRLF.
+* text=auto eol=lf
+
+*.c        text eol=lf
+*.h        text eol=lf
+*.md       text eol=lf
+*.ld       text eol=lf
+*.rc       text eol=lf
+*.manifest text eol=lf
+Makefile   text eol=lf
+
+# Windows tooling is unhappy with LF in these.
+*.bat text eol=crlf
+*.inf text eol=crlf
+
+# Never touch: mangling any of these corrupts them.
+*.exe binary
+*.bin binary
+*.cat binary
+*.hex binary
+LICENSE -text

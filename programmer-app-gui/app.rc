@@ -1,0 +1,37 @@
+/*
+ * app.rc - resources for programmer_gui.exe
+ *
+ * Copyright (C) 2026  telink_project contributors
+ * SPDX-License-Identifier: GPL-2.0-only
+ *
+ * The only resource is the application manifest.  Without it Windows loads
+ * comctl32 v5 and the tab control, list views and progress bar render in the
+ * pre-XP style; requesting v6 gives the themed look the rest of the system
+ * uses.
+ */
+#include <winuser.h>
+#include "res.h"
+
+#ifndef RT_MANIFEST
+#define RT_MANIFEST 24
+#endif
+#ifndef CREATEPROCESS_MANIFEST_RESOURCE_ID
+#define CREATEPROCESS_MANIFEST_RESOURCE_ID 1
+#endif
+
+CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "app.manifest"
+
+/* Debugger toolbar icons.  Multi-size .ico so LoadImage() can ask for 24 or 32
+ * and get a purpose-drawn bitmap rather than a resampled one. */
+IDI_D_CONTINUE  ICON "icons/continue.ico"
+IDI_D_PAUSE     ICON "icons/pause.ico"
+IDI_D_STOP      ICON "icons/stop.ico"
+IDI_D_RESTART   ICON "icons/restart.ico"
+IDI_D_STEPINTO  ICON "icons/step_into.ico"
+IDI_D_STEPOVER  ICON "icons/step_over.ico"
+IDI_D_STEPOUT   ICON "icons/step_out.ico"
+IDI_D_STEPINST  ICON "icons/step_inst.ico"
+IDI_D_RUNCUR    ICON "icons/run_to_cursor.ico"
+IDI_D_BPTOGGLE  ICON "icons/bp_toggle.ico"
+IDI_D_BPCLEAR   ICON "icons/bp_remove_all.ico"
+IDI_D_REFRESH   ICON "icons/refresh.ico"
