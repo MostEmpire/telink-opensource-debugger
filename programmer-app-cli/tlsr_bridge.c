@@ -34,6 +34,20 @@ static const char *status_text(uint8_t st)
     }
 }
 
+void tlsr_set_stage_cb(tlsr_dev *d, tlsr_stage_fn fn, void *user)
+{
+    if (!d)
+        return;
+    d->stage_cb   = fn;
+    d->stage_user = user;
+}
+
+void tlsr_stage(tlsr_dev *d, int stage)
+{
+    if (d && d->stage_cb)
+        d->stage_cb(d->stage_user, stage);
+}
+
 int tlsr_cmd(tlsr_dev *d, uint8_t cmd, const uint8_t *payload, uint16_t len,
              uint8_t *reply, uint16_t reply_max, uint16_t *reply_len,
              unsigned timeout_ms)

@@ -204,6 +204,7 @@ int tlsr_flash_erase(tlsr_dev *d, uint32_t addr, uint32_t len,
         len = TLSR_FLASH_SECTOR;
 
     sectors = (len + TLSR_FLASH_SECTOR - 1) / TLSR_FLASH_SECTOR;
+    tlsr_stage(d, TLSR_STAGE_ERASE);
     TLSR_LOG(log, user, "erasing %u sector(s) from 0x%06X",
              (unsigned)sectors, (unsigned)addr);
 
@@ -241,6 +242,7 @@ static int program_pages(tlsr_dev *d, uint32_t addr, const uint8_t *data,
 {
     uint32_t done = 0;
 
+    tlsr_stage(d, TLSR_STAGE_PROGRAM);
     while (done < n) {
         uint8_t p[3 + TLSR_FLASH_PAGE];
         uint32_t a = addr + done;
@@ -348,7 +350,11 @@ int tlsr_flash_program_ex(tlsr_dev *d, uint32_t addr, const uint8_t *data,
         TLSR_LOG(log, user, "step %d/%d: erasing %u sector(s) at 0x%06X",
                  ++step, steps, (unsigned)(span / TLSR_FLASH_SECTOR),
                  (unsigned)base);
-        rc = tlsr_flash_erase(d, base, span, NULL, NULL, NULL);
+        /* `log` stays NULL so the sub-step does not narrate a second heading
+         * of its own, but `prog` is passed on: erasing a large image is the
+         * slowest stage there is, and a bar frozen at zero through it reads as
+         * a hang. */
+        rc = tlsr_flash_erase(d, base, span, prog, NULL, user);
         if (rc != TLSR_OK)
             goto out;
 
@@ -362,7 +368,7 @@ int tlsr_flash_program_ex(tlsr_dev *d, uint32_t addr, const uint8_t *data,
     if (stages & TLSR_PROG_VERIFY) {
         TLSR_LOG(log, user, "step %d/%d: verifying %u bytes at 0x%06X",
                  ++step, steps, (unsigned)n, (unsigned)addr);
-        rc = tlsr_flash_verify(d, addr, data, n, NULL, NULL, NULL);
+        rc = tlsr_flash_verify(d, addr, data, n, NULL, prog, user);
     } else {
         TLSR_LOG(log, user, "verify skipped - the write was not read back");
         rc = TLSR_OK;
@@ -386,6 +392,9 @@ int tlsr_flash_verify(tlsr_dev *d, uint32_t addr, const uint8_t *data,
         tlsr_set_error("out of memory for a %u byte verify buffer", (unsigned)n);
         return TLSR_E_ARG;
     }
+    /* tlsr_flash_read() deliberately announces no stage of its own, so the
+     * read-back that verification is built on stays labelled as verification. */
+    tlsr_stage(d, TLSR_STAGE_VERIFY);
     rc = tlsr_flash_read(d, addr, back, n, prog, user);
     if (rc != TLSR_OK) {
         free(back);

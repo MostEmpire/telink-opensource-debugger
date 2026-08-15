@@ -20,7 +20,12 @@ struct tlsr_dev {
     tlsr_cfg cfg;          /* last configuration read from the bridge   */
     int      cfg_valid;
     int      activated;    /* target has answered since we connected     */
+    tlsr_stage_fn stage_cb;
+    void         *stage_user;
 };
+
+/* Announce which phase the core has entered.  Silent when no front end asked. */
+void tlsr_stage(tlsr_dev *d, int stage);
 
 /* Largest SWire payload the bridge will encode in one frame, and the largest
  * flash block it will transfer per command.  Both are limited by the buffers

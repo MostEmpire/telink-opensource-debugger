@@ -102,6 +102,11 @@ static int    g_prog_pct = -1;
 static int    g_busy;
 static int    g_rails = -1;        /* -1 unknown, else a TLSR_RAIL_* mask */
 
+/* Which phase of an operation the worker is in.  It is published here rather
+ * than painted directly: the worker must not touch a window, so the 100 ms UI
+ * timer is what turns this into the bar colour. */
+static int    g_stage = TLSR_STAGE_IDLE;
+
 /* --- debugger state.  Written by the worker, read by the UI thread after a
  * WM_APP+2; the values are plain words so a torn read is not possible. */
 static HWND      g_tip;                    /* shared tooltip control          */
@@ -177,9 +182,37 @@ static void core_progress(void *user, uint32_t done, uint32_t total)
     LeaveCriticalSection(&g_lock);
 }
 
-/* Throttled narration so a long transfer reads as progress, not a hang. */
+/* Throttled narration so a long transfer reads as progress, not a hang.
+ * Touched only by the worker thread, so it needs no lock. */
 static DWORD       g_narrate_next;
 static const char *g_narrate_label;
+
+/* The core calls this as it moves between erase, program and verify; the timer
+ * turns it into the bar colour.  Called on the worker thread. */
+static void core_stage(void *user, int stage)
+{
+    (void)user;
+    EnterCriticalSection(&g_lock);
+    g_stage = stage;
+    /* Each stage restarts at nothing done, so drop the previous stage's fill
+     * rather than letting a full bar sit there until the first callback. */
+    g_prog_pct = 0;
+    LeaveCriticalSection(&g_lock);
+
+    /* Rename the narration with the stage, and give the new stage its own
+     * throttle window.  Without this a program run reports "programming:
+     * 8192/16384" while it is in fact erasing. */
+    switch (stage) {
+    case TLSR_STAGE_READ:    g_narrate_label = "reading";     break;
+    case TLSR_STAGE_ERASE:   g_narrate_label = "erasing";     break;
+    case TLSR_STAGE_PROGRAM: g_narrate_label = "programming"; break;
+    case TLSR_STAGE_VERIFY:  g_narrate_label = "verifying";   break;
+    default: return;                       /* idle: leave the label alone */
+    }
+    g_narrate_next = GetTickCount() + 2000;
+}
+
+static void set_stage(int stage) { core_stage(NULL, stage); }
 
 static void narrate_begin(const char *label)
 {
@@ -278,6 +311,40 @@ static int is_checked(int id)
 {
     return SendMessageA(GetDlgItem(g_main, id), BM_GETCHECK, 0, 0)
            == BST_CHECKED;
+}
+
+/* Take the visual style off one control.  uxtheme is loaded by hand rather
+ * than linked so the build needs no extra import library, and the module stays
+ * loaded because the control keeps calling back into it. */
+static void unthemify(HWND c)
+{
+    typedef HRESULT (WINAPI *set_theme_fn)(HWND, LPCWSTR, LPCWSTR);
+    static HMODULE ux;
+    set_theme_fn f;
+
+    if (!c)
+        return;
+    if (!ux)
+        ux = LoadLibraryA("uxtheme.dll");
+    if (!ux)
+        return;
+    f = (set_theme_fn)(void *)GetProcAddress(ux, "SetWindowTheme");
+    if (f)
+        f(c, L"", L"");
+}
+
+/* Stage colours.  Erase and verify are the two stages that are easy to mistake
+ * for a stalled program run -- erase because the bar barely moves, verify
+ * because it looks exactly like a read -- so those are the two that get a
+ * colour of their own.  Everything else stays the green it has always been. */
+static void set_bar_stage(int stage)
+{
+    COLORREF c = RGB(0, 170, 0);            /* read / program / idle       */
+
+    if (stage == TLSR_STAGE_ERASE)  c = RGB(240, 140, 0);   /* orange      */
+    if (stage == TLSR_STAGE_VERIFY) c = RGB(0, 110, 220);   /* blue        */
+    SendMessageA(GetDlgItem(g_main, IDC_PROGRESS), PBM_SETBARCOLOR, 0,
+                 (LPARAM)c);
 }
 
 /* A BS_ICON button shows no text at all, so an icon-only toolbar is unusable
@@ -576,6 +643,7 @@ static DWORD WINAPI worker_main(LPVOID arg)
         EnterCriticalSection(&g_lock);
         g_busy = 0;
         g_prog_pct = 0;
+        g_stage = TLSR_STAGE_IDLE;
         LeaveCriticalSection(&g_lock);
     }
     return 0;                       /* not reached; the loop never exits */
@@ -1073,6 +1141,7 @@ static void job_read(void)
     if (!buf) { ui_log("! out of memory"); return; }
 
     ui_log("> read %u bytes at 0x%06X ...", (unsigned)n, (unsigned)addr);
+    set_stage(TLSR_STAGE_READ);
     narrate_begin("reading");
     if ((is_flash ? tlsr_flash_read(g_dev, addr, buf, n, narrate_progress, NULL)
                   : tlsr_read(g_dev, addr, buf, n)) != TLSR_OK) {
@@ -1120,6 +1189,7 @@ static void job_dump_range(void)
 
     ui_log("> dump range: reading %u bytes at 0x%06X first ...",
            (unsigned)n, (unsigned)addr);
+    set_stage(TLSR_STAGE_READ);
     narrate_begin("reading");
     if (tlsr_flash_read(g_dev, addr, buf, n, narrate_progress, NULL)
         != TLSR_OK) {
@@ -1149,6 +1219,7 @@ static void job_patch(void)
     n = parse_values(g_job.text, buf, sizeof buf, err, sizeof err);
     if (n <= 0) { ui_log("! %s", err); return; }
 
+    set_stage(TLSR_STAGE_PROGRAM);
     if (tlsr_write(g_dev, g_job.addr, buf, (uint32_t)n) != TLSR_OK) {
         ui_log("! %s", tlsr_last_error());
         return;
@@ -1160,6 +1231,7 @@ static void job_patch(void)
         ui_log("  verify skipped - the write was not read back");
         return;
     }
+    set_stage(TLSR_STAGE_VERIFY);
     if (tlsr_read(g_dev, g_job.addr, back, (uint32_t)n) == TLSR_OK)
         ui_log("  read-back %s", memcmp(back, buf, (size_t)n) == 0
                                  ? "matches" : "DIFFERS");
@@ -1179,6 +1251,7 @@ static void job_flash_dump(void)
 
     ui_log("> dump %u KB of flash to %s (expect roughly %u s) ...",
            (unsigned)(size / 1024), g_job.path, (unsigned)(size / 21500));
+    set_stage(TLSR_STAGE_READ);
     narrate_begin("dumping");
     t0 = GetTickCount();
     if (tlsr_flash_read(g_dev, 0, buf, size, narrate_progress, NULL) != TLSR_OK) {
@@ -1200,6 +1273,7 @@ static void job_flash_erase(void)
     if (!need_target()) return;
     ui_log("> erase %u byte(s) at 0x%06X ...",
            (unsigned)g_job.len, (unsigned)g_job.addr);
+    set_stage(TLSR_STAGE_ERASE);
     narrate_begin("erasing");
     if (tlsr_flash_erase(g_dev, g_job.addr, g_job.len,
                          narrate_progress, core_log, NULL) != TLSR_OK)
@@ -1245,6 +1319,7 @@ static void job_flash_program(void)
         uint32_t bad = 0;
         ui_log("> verify %u bytes at 0x%06X against the file ...",
                (unsigned)n, (unsigned)g_job.addr);
+        set_stage(TLSR_STAGE_VERIFY);
         if (tlsr_flash_verify(g_dev, g_job.addr, blob, n, &bad,
                               narrate_progress, NULL) == TLSR_OK)
             ui_log("  verify OK");
@@ -1255,6 +1330,9 @@ static void job_flash_program(void)
                (unsigned)n, (unsigned)g_job.addr,
                (g_job.stages & TLSR_PROG_ERASE)  ? "erase"  : "no erase",
                (g_job.stages & TLSR_PROG_VERIFY) ? "verify" : "no verify");
+        /* The core announces erase / program / verify as it reaches them; this
+         * covers the sector-preserving read that runs before the first of them. */
+        set_stage(TLSR_STAGE_PROGRAM);
         if (tlsr_flash_program_ex(g_dev, g_job.addr, blob, n, g_job.stages,
                                   narrate_progress, core_log, NULL) == TLSR_OK)
             ui_log("  programmed %u bytes%s", (unsigned)n,
@@ -1622,6 +1700,10 @@ static void do_connect(void)
         ui_log("connected to %s: %s firmware %u.%u", port, id,
                ver >> 8, ver & 0xFF);
     }
+    /* The core reports which stage of a program run it is in so the bar can be
+     * coloured; it is called on the worker thread, which is why core_stage only
+     * publishes and never paints. */
+    tlsr_set_stage_cb(g_dev, core_stage, NULL);
     submit(job_probe);
 }
 
@@ -1646,7 +1728,7 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_TIMER: {
         char *chunk = NULL;
         size_t len = 0;
-        int pct, rails;
+        int pct, rails, stage;
 
         EnterCriticalSection(&g_lock);
         if (g_loglen) {
@@ -1660,6 +1742,7 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l)
         }
         pct   = g_prog_pct;
         rails = g_rails;
+        stage = g_stage;
         LeaveCriticalSection(&g_lock);
 
         if (chunk && len) {
@@ -1675,6 +1758,16 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l)
         free(chunk);
         if (pct >= 0)
             SendMessageA(GetDlgItem(h, IDC_PROGRESS), PBM_SETPOS, pct, 0);
+
+        /* Orange while sectors are erased, green while they are programmed,
+         * blue while the result is read back. */
+        {
+            static int shown_stage = -1;
+            if (stage != shown_stage) {
+                shown_stage = stage;
+                set_bar_stage(stage);
+            }
+        }
 
         /* The rail state is whatever the worker last observed, so an operation
          * that powered the target up on our behalf is reflected here too. */
@@ -1695,6 +1788,32 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l)
                 set_text(IDC_POWERLBL, s);
             }
         }
+        return 0;
+    }
+
+    /* The trough's outline is drawn here, in the parent, rather than by the
+     * control.  An un-themed progress bar draws no frame of its own, and it
+     * ignores WS_EX_CLIENTEDGE as well, so without this the bar is a bare grey
+     * rectangle floating on the window.  One rectangle hugging the control is
+     * all it takes, and it lands on parent pixels so nothing can clip it. */
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(h, &ps);
+        HWND pb = GetDlgItem(h, IDC_PROGRESS);
+        RECT r;
+
+        if (pb && GetWindowRect(pb, &r)) {
+            HPEN   pen = CreatePen(PS_SOLID, 1, RGB(160, 160, 160));
+            HGDIOBJ op, ob;
+            MapWindowPoints(NULL, h, (POINT *)&r, 2);
+            op = SelectObject(dc, pen);
+            ob = SelectObject(dc, GetStockObject(NULL_BRUSH));
+            Rectangle(dc, r.left - 1, r.top - 1, r.right + 1, r.bottom + 1);
+            SelectObject(dc, ob);
+            SelectObject(dc, op);
+            DeleteObject(pen);
+        }
+        EndPaint(h, &ps);
         return 0;
     }
 
@@ -2044,8 +2163,25 @@ static void build_controls(void)
     mk_button("Connect", 220, 8, 80, IDC_CONNECT);
     mk_static("disconnected", 310, 12, 150, IDC_STATUS);
     mk_static("Device: not connected", 466, 12, 180, IDC_POWERLBL);
-    ctl(PROGRESS_CLASSA, "", 0, 660, 10, 180, 18, IDC_PROGRESS);
-    SendMessageA(GetDlgItem(g_main, IDC_PROGRESS), PBM_SETRANGE32, 0, 100);
+    /* PBM_SETBARCOLOR is ignored while the control is themed, and the manifest
+     * asks for comctl32 v6, so theming comes off this one control -- otherwise
+     * the bar stays system green whatever stage is running.
+     *
+     * That has a catch worth spelling out: an un-themed bar draws no frame of
+     * its own and paints its unfilled part in the dialog colour, so at 0% it
+     * vanished into the background completely.  A sunken client edge and a
+     * track a shade darker than the window put back the bordered grey trough
+     * the themed control drew for us. */
+    {
+        HWND pb = CreateWindowExA(WS_EX_CLIENTEDGE, PROGRESS_CLASSA, "",
+                                  WS_CHILD | WS_CLIPSIBLINGS, 660, 10, 180, 18,
+                                  g_main, (HMENU)(INT_PTR)IDC_PROGRESS,
+                                  g_inst, NULL);
+        unthemify(pb);
+        SendMessageA(pb, PBM_SETRANGE32, 0, 100);
+        SendMessageA(pb, PBM_SETBKCOLOR, 0, (LPARAM)RGB(230, 230, 230));
+        set_bar_stage(TLSR_STAGE_IDLE);
+    }
 
     /* --- tabs ---------------------------------------------------------- */
     g_tabs = ctl(WC_TABCONTROLA, "", 0, 8, TAB_TOP, 800, 360, IDC_TABS);

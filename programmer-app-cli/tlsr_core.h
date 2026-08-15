@@ -111,6 +111,20 @@ const char *tlsr_last_error(void);
 typedef void (*tlsr_progress_fn)(void *user, uint32_t done, uint32_t total);
 typedef void (*tlsr_log_fn)(void *user, const char *line);
 
+/* Which phase of a multi-stage operation the core is in.  A programming run is
+ * erase -> program -> verify, and the progress bar restarts at 0% for each, so
+ * a front end that only sees `tlsr_progress_fn` cannot tell the three apart.
+ * The stage callback closes that gap; it is optional and costs nothing when it
+ * is not installed. */
+enum {
+    TLSR_STAGE_IDLE = 0,
+    TLSR_STAGE_READ,
+    TLSR_STAGE_ERASE,
+    TLSR_STAGE_PROGRAM,
+    TLSR_STAGE_VERIFY
+};
+typedef void (*tlsr_stage_fn)(void *user, int stage);
+
 /* ------------------------------------------------------------------ device -- */
 typedef struct tlsr_dev tlsr_dev;   /* opaque connection handle */
 
@@ -168,6 +182,11 @@ int tlsr_activate(tlsr_dev *d, uint16_t frames);
 int tlsr_selftest(tlsr_dev *d, uint8_t echo[8], int *ok);
 int tlsr_pintest(tlsr_dev *d, uint8_t levels[3], int *ok);
 int tlsr_get_raw(tlsr_dev *d, uint8_t *out, uint32_t max, uint32_t *len);
+
+/* Install (or with fn == NULL remove) the stage callback.  It is called from
+ * whichever thread drives the operation, so a front end must publish rather
+ * than paint from inside it. */
+void tlsr_set_stage_cb(tlsr_dev *d, tlsr_stage_fn fn, void *user);
 
 /* ------------------------------------------------- SWire register / SRAM ---- */
 int tlsr_read(tlsr_dev *d, uint32_t addr, uint8_t *out, uint32_t n);
