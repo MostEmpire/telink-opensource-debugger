@@ -36,7 +36,7 @@
 /* ---------------------------------------------------------- control ids --- */
 enum {
     IDC_PORT = 1000, IDC_RESCAN, IDC_CONNECT, IDC_STATUS, IDC_POWERLBL,
-    IDC_PROGRESS, IDC_TABS, IDC_LOG,
+    IDC_PROGRESS, IDC_VERDICT, IDC_TABS, IDC_LOG,
 
     IDC_T_PROBE = 1100, IDC_T_PWRON, IDC_T_PWROFF, IDC_T_HALT, IDC_T_RUN,
     IDC_T_RESET, IDC_T_IDENT, IDC_T_CAPS, IDC_T_REGIONS,
@@ -89,7 +89,7 @@ enum { MODE_SIZE = 0, MODE_END = 1 };
 /* ------------------------------------------------------------- app state -- */
 static HINSTANCE g_inst;
 static HWND      g_main, g_tabs, g_log;
-static HFONT     g_font, g_mono;
+static HFONT     g_font, g_mono, g_bold;
 static tlsr_dev *g_dev;
 static tlsr_info g_info;
 static int       g_have_info;
@@ -102,10 +102,16 @@ static int    g_prog_pct = -1;
 static int    g_busy;
 static int    g_rails = -1;        /* -1 unknown, else a TLSR_RAIL_* mask */
 
-/* Which phase of an operation the worker is in.  It is published here rather
- * than painted directly: the worker must not touch a window, so the 100 ms UI
- * timer is what turns this into the bar colour. */
-static int    g_stage = TLSR_STAGE_IDLE;
+/* Which phase of an operation the worker is in, and how a finished write ended.
+ * Both are published here rather than painted directly: the worker must not
+ * touch a window, so the 100 ms UI timer is what turns these into colour.
+ *
+ * g_verdict_seq exists because two runs in a row can end the same way -- the
+ * value alone would not tell the UI thread that a new result had arrived, and
+ * the PASS/FAIL would keep the timeout of the previous one. */
+static int      g_stage = TLSR_STAGE_IDLE;
+static int      g_verdict;              /* 0 none, 1 PASS, 2 FAIL          */
+static unsigned g_verdict_seq;
 
 /* --- debugger state.  Written by the worker, read by the UI thread after a
  * WM_APP+2; the values are plain words so a torn read is not possible. */
@@ -213,6 +219,16 @@ static void core_stage(void *user, int stage)
 }
 
 static void set_stage(int stage) { core_stage(NULL, stage); }
+
+/* The outcome of a write, for the PASS/FAIL under the bar.  Only operations
+ * that change the target report one -- a read has nothing to pass or fail. */
+static void set_verdict(int pass)
+{
+    EnterCriticalSection(&g_lock);
+    g_verdict = pass ? 1 : 2;
+    g_verdict_seq++;
+    LeaveCriticalSection(&g_lock);
+}
 
 static void narrate_begin(const char *label)
 {
@@ -1235,13 +1251,14 @@ static void job_patch(void)
     char err[160];
     int n;
 
-    if (!need_target()) return;
+    if (!need_target()) { set_verdict(0); return; }
     n = parse_values(g_job.text, buf, sizeof buf, err, sizeof err);
-    if (n <= 0) { ui_log("! %s", err); return; }
+    if (n <= 0) { ui_log("! %s", err); set_verdict(0); return; }
 
     set_stage(TLSR_STAGE_PROGRAM);
     if (tlsr_write(g_dev, g_job.addr, buf, (uint32_t)n) != TLSR_OK) {
         ui_log("! %s", tlsr_last_error());
+        set_verdict(0);
         return;
     }
     ui_log("patched %d byte(s) at 0x%06X-0x%06X", n, (unsigned)g_job.addr,
@@ -1249,12 +1266,22 @@ static void job_patch(void)
 
     if (!(g_job.flag & TLSR_PROG_VERIFY)) {
         ui_log("  verify skipped - the write was not read back");
+        /* Nothing was checked, but nothing failed either: the write itself is
+         * all there is to report on. */
+        set_verdict(1);
         return;
     }
     set_stage(TLSR_STAGE_VERIFY);
-    if (tlsr_read(g_dev, g_job.addr, back, (uint32_t)n) == TLSR_OK)
-        ui_log("  read-back %s", memcmp(back, buf, (size_t)n) == 0
-                                 ? "matches" : "DIFFERS");
+    if (tlsr_read(g_dev, g_job.addr, back, (uint32_t)n) != TLSR_OK) {
+        ui_log("! read-back failed: %s", tlsr_last_error());
+        set_verdict(0);
+        return;
+    }
+    {
+        int same = memcmp(back, buf, (size_t)n) == 0;
+        ui_log("  read-back %s", same ? "matches" : "DIFFERS");
+        set_verdict(same);
+    }
 }
 
 static void job_flash_dump(void)
@@ -1290,16 +1317,19 @@ static void job_flash_dump(void)
 
 static void job_flash_erase(void)
 {
-    if (!need_target()) return;
+    if (!need_target()) { set_verdict(0); return; }
     ui_log("> erase %u byte(s) at 0x%06X ...",
            (unsigned)g_job.len, (unsigned)g_job.addr);
     set_stage(TLSR_STAGE_ERASE);
     narrate_begin("erasing");
     if (tlsr_flash_erase(g_dev, g_job.addr, g_job.len,
-                         narrate_progress, core_log, NULL) != TLSR_OK)
+                         narrate_progress, core_log, NULL) != TLSR_OK) {
         ui_log("! %s", tlsr_last_error());
-    else
+        set_verdict(0);
+    } else {
         ui_log("  erased");
+        set_verdict(1);
+    }
 }
 
 static void job_flash_program(void)
@@ -1309,9 +1339,13 @@ static void job_flash_program(void)
     uint8_t *blob;
     uint32_t n;
 
-    if (!need_target()) return;
+    if (!need_target()) { set_verdict(0); return; }
     f = fopen(g_job.path, "rb");
-    if (!f) { ui_log("! cannot read %s", g_job.path); return; }
+    if (!f) {
+        ui_log("! cannot read %s", g_job.path);
+        set_verdict(0);
+        return;
+    }
     fseek(f, 0, SEEK_END);
     fsize = ftell(f);
     fseek(f, 0, SEEK_SET);
@@ -1319,6 +1353,7 @@ static void job_flash_program(void)
         ui_log("! offset 0x%X is past the end of the file (%ld bytes)",
                (unsigned)g_job.off, fsize);
         fclose(f);
+        set_verdict(0);
         return;
     }
     n = g_job.len ? g_job.len : (uint32_t)fsize - g_job.off;
@@ -1326,11 +1361,11 @@ static void job_flash_program(void)
         n = (uint32_t)fsize - g_job.off;
 
     blob = (uint8_t *)malloc(n);
-    if (!blob) { fclose(f); ui_log("! out of memory"); return; }
+    if (!blob) { fclose(f); ui_log("! out of memory"); set_verdict(0); return; }
     fseek(f, (long)g_job.off, SEEK_SET);
     if (fread(blob, 1, n, f) != n) {
         ui_log("! short read from %s", g_job.path);
-        free(blob); fclose(f); return;
+        free(blob); fclose(f); set_verdict(0); return;
     }
     fclose(f);
 
@@ -1341,10 +1376,13 @@ static void job_flash_program(void)
                (unsigned)n, (unsigned)g_job.addr);
         set_stage(TLSR_STAGE_VERIFY);
         if (tlsr_flash_verify(g_dev, g_job.addr, blob, n, &bad,
-                              narrate_progress, NULL) == TLSR_OK)
+                              narrate_progress, NULL) == TLSR_OK) {
             ui_log("  verify OK");
-        else
+            set_verdict(1);
+        } else {
             ui_log("! %s", tlsr_last_error());
+            set_verdict(0);
+        }
     } else {
         ui_log("> program %u bytes to flash 0x%06X (%s, %s) ...",
                (unsigned)n, (unsigned)g_job.addr,
@@ -1354,11 +1392,14 @@ static void job_flash_program(void)
          * covers the sector-preserving read that runs before the first of them. */
         set_stage(TLSR_STAGE_PROGRAM);
         if (tlsr_flash_program_ex(g_dev, g_job.addr, blob, n, g_job.stages,
-                                  narrate_progress, core_log, NULL) == TLSR_OK)
+                                  narrate_progress, core_log, NULL) == TLSR_OK) {
             ui_log("  programmed %u bytes%s", (unsigned)n,
                    (g_job.stages & TLSR_PROG_VERIFY) ? " and verified" : "");
-        else
+            set_verdict(1);
+        } else {
             ui_log("! %s", tlsr_last_error());
+            set_verdict(0);
+        }
     }
     free(blob);
 }
@@ -1474,6 +1515,17 @@ static void show_tab(int t)
 /* ------------------------------------------------------------- resizing --- */
 #define TAB_TOP     40
 #define LOG_H      154
+
+/* Where the PASS / FAIL box sits, and how tall it is.  The text is centred in
+ * this box (SS_CENTERIMAGE), so moving the box is how the word moves.
+ *
+ * It deliberately runs down past TAB_TOP.  The tab control starts there, but
+ * this is the far right of its strip -- well past the last tab -- so the only
+ * thing underneath is empty background, and the extra room is what lets the
+ * word be read from arm's length.  The tab control is sunk to the bottom of
+ * the z-order in build_controls(), so it cannot paint over the label. */
+#define VERDICT_Y   28
+#define VERDICT_H   20
 #define PAGE_LEFT   20
 #define PAGE_TOP    78
 
@@ -1518,7 +1570,13 @@ static void layout(int cw, int ch)
 
     MoveWindow(g_tabs, 8, TAB_TOP, cw - 16, ch - TAB_TOP - LOG_H - 16, TRUE);
     MoveWindow(g_log, 8, ch - LOG_H - 8, cw - 16, LOG_H, TRUE);
-    MoveWindow(GetDlgItem(g_main, IDC_PROGRESS), cw - 196, 10, 180, 18, TRUE);
+    /* The bar loses two pixels of height so the verdict fits underneath it
+     * inside the existing top bar -- the tab strip still starts at TAB_TOP, so
+     * no page lost any room to this.  The label is the same width as the bar
+     * and right-aligned, which puts PASS/FAIL flush with the bar's right end. */
+    MoveWindow(GetDlgItem(g_main, IDC_PROGRESS), cw - 196, 6, 180, 16, TRUE);
+    MoveWindow(GetDlgItem(g_main, IDC_VERDICT), cw - 196, VERDICT_Y, 180,
+               VERDICT_H, TRUE);
 
     /* --- Target: identity fixed, capabilities fill the rest -------------- */
     {
@@ -1729,6 +1787,58 @@ static void do_connect(void)
     submit(job_link_state);
 }
 
+/* ------------------------------------------------------------- PASS / FAIL -- */
+/* How the last write ended, shown under the progress bar and then taken away
+ * again.  It is deliberately not dismissed on a plain timer: a long program run
+ * can finish while nobody is watching, and a result nobody saw is worse than
+ * none.  The countdown therefore starts when the user comes back and touches
+ * something.  GetLastInputInfo() is what makes "touches something" include
+ * moving the mouse across a child control, which never sends this window a
+ * message of its own. */
+#define VERDICT_LINGER_MS 5000
+
+static int      g_v_shown;      /* what the label currently says              */
+static unsigned g_v_seq;        /* the verdict it was built from              */
+static DWORD    g_v_input;      /* last system input when it appeared         */
+static DWORD    g_v_hide_at;    /* 0 until the user has interacted            */
+
+static DWORD last_input_time(void)
+{
+    LASTINPUTINFO li;
+    li.cbSize = sizeof li;
+    return GetLastInputInfo(&li) ? li.dwTime : 0;
+}
+
+static void verdict_tick(int verdict, unsigned seq)
+{
+    HWND lbl = GetDlgItem(g_main, IDC_VERDICT);
+
+    if (seq != g_v_seq) {                       /* a new result arrived */
+        g_v_seq     = seq;
+        g_v_shown   = verdict;
+        g_v_input   = last_input_time();
+        g_v_hide_at = 0;
+        SetWindowTextA(lbl, verdict == 1 ? "PASS" :
+                            verdict == 2 ? "FAIL" : "");
+        InvalidateRect(lbl, NULL, TRUE);
+        ShowWindow(lbl, verdict ? SW_SHOW : SW_HIDE);
+        return;
+    }
+    if (!g_v_shown)
+        return;
+
+    if (!g_v_hide_at) {
+        DWORD t = last_input_time();
+        /* Only input aimed at this application counts; typing in another
+         * window is not the user acknowledging anything here. */
+        if (t != g_v_input && GetForegroundWindow() == g_main)
+            g_v_hide_at = GetTickCount() + VERDICT_LINGER_MS;
+    } else if ((LONG)(GetTickCount() - g_v_hide_at) >= 0) {
+        g_v_shown = 0;
+        ShowWindow(lbl, SW_HIDE);
+    }
+}
+
 /* ------------------------------------------------------------ window proc -- */
 static void build_controls(void);
 
@@ -1750,7 +1860,8 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_TIMER: {
         char *chunk = NULL;
         size_t len = 0;
-        int pct, rails, stage;
+        int pct, rails, stage, verdict;
+        unsigned vseq;
 
         EnterCriticalSection(&g_lock);
         if (g_loglen) {
@@ -1762,9 +1873,11 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l)
             }
             g_loglen = 0;
         }
-        pct   = g_prog_pct;
-        rails = g_rails;
-        stage = g_stage;
+        pct     = g_prog_pct;
+        rails   = g_rails;
+        stage   = g_stage;
+        verdict = g_verdict;
+        vseq    = g_verdict_seq;
         LeaveCriticalSection(&g_lock);
 
         if (chunk && len) {
@@ -1790,6 +1903,7 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l)
                 set_bar_stage(stage);
             }
         }
+        verdict_tick(verdict, vseq);
 
         /* The rail state is whatever the worker last observed, so an operation
          * that powered the target up on our behalf is reflected here too. */
@@ -1838,6 +1952,17 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l)
         EndPaint(h, &ps);
         return 0;
     }
+
+    /* Green PASS, red FAIL.  Everything else keeps the default handling --
+     * this message also arrives for the read-only log and hex boxes. */
+    case WM_CTLCOLORSTATIC:
+        if (GetDlgCtrlID((HWND)l) == IDC_VERDICT) {
+            SetBkMode((HDC)w, TRANSPARENT);
+            SetTextColor((HDC)w, g_v_shown == 2 ? RGB(200, 0, 0)
+                                                : RGB(0, 150, 0));
+            return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
+        }
+        break;
 
     case WM_APP + 2:                       /* worker touched the CPU state */
         dbg_update_enable();
@@ -2196,13 +2321,22 @@ static void build_controls(void)
      * the themed control drew for us. */
     {
         HWND pb = CreateWindowExA(WS_EX_CLIENTEDGE, PROGRESS_CLASSA, "",
-                                  WS_CHILD | WS_CLIPSIBLINGS, 660, 10, 180, 18,
+                                  WS_CHILD | WS_CLIPSIBLINGS, 660, 6, 180, 16,
                                   g_main, (HMENU)(INT_PTR)IDC_PROGRESS,
                                   g_inst, NULL);
         unthemify(pb);
         SendMessageA(pb, PBM_SETRANGE32, 0, 100);
         SendMessageA(pb, PBM_SETBKCOLOR, 0, (LPARAM)RGB(230, 230, 230));
         set_bar_stage(TLSR_STAGE_IDLE);
+    }
+
+    /* Sits under the bar, hidden until an operation has something to report.
+     * SS_CENTERIMAGE is what centres the text vertically in whatever height
+     * layout() gives it; SS_RIGHT keeps it flush with the bar's right end. */
+    {
+        HWND v = ctl("STATIC", "", SS_RIGHT | SS_CENTERIMAGE,
+                     660, VERDICT_Y, 180, VERDICT_H, IDC_VERDICT);
+        SendMessageA(v, WM_SETFONT, (WPARAM)g_bold, TRUE);
     }
 
     /* --- tabs ---------------------------------------------------------- */
@@ -2485,6 +2619,12 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     g_mono = CreateFontA(-12, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
                          OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                          CLEARTYPE_QUALITY, FIXED_PITCH, "Consolas");
+    /* PASS / FAIL is the one thing on screen that has to read from across a
+     * bench, so it is both larger and heavier than the UI font.  It has the
+     * band between the progress bar and the tab strip to itself. */
+    g_bold = CreateFontA(-19, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET,
+                         OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                         CLEARTYPE_QUALITY, DEFAULT_PITCH, "Segoe UI");
 
     memset(&wc, 0, sizeof wc);
     wc.cbSize        = sizeof wc;
