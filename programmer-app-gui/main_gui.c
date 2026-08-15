@@ -824,6 +824,26 @@ static void job_power(void)
         ui_log("target power %s", on ? "on" : "off");
 }
 
+/* Connecting opens the serial port and nothing else: the target is left in
+ * whatever state it was in, because powering a board up is something the user
+ * asks for, not a side effect of plugging in the bridge.  This job only reads
+ * the rail state back so the header can report it honestly. */
+static void job_link_state(void)
+{
+    uint8_t rails = 0;
+
+    if (!g_dev) { ui_log("not connected"); return; }
+    if (tlsr_get_cfg(g_dev, NULL, &rails) != TLSR_OK) {
+        ui_log("! %s", tlsr_last_error());
+        return;
+    }
+    if (rails)
+        ui_log("target power is already on - left as it was found");
+    else
+        ui_log("target is NOT powered.  It powers up on the first operation "
+               "that needs it, or from Target -> Power on / Re-probe.");
+}
+
 static void job_halt(void)
 {
     if (!need_target()) return;
@@ -1704,7 +1724,9 @@ static void do_connect(void)
      * coloured; it is called on the worker thread, which is why core_stage only
      * publishes and never paints. */
     tlsr_set_stage_cb(g_dev, core_stage, NULL);
-    submit(job_probe);
+    /* Deliberately NOT a probe: identifying the chip powers the target up, and
+     * connecting to the bridge must not do that by itself. */
+    submit(job_link_state);
 }
 
 /* ------------------------------------------------------------ window proc -- */
