@@ -29,6 +29,10 @@ bin\programmer_cli.exe -p COM10 --dump -f backup.bin
 ```
 ## Images
 
+The GUI looks like this:
+
+<img width="948" height="696" alt="image" src="doc/programmer_GUI.png" />
+
 The schematic of the Blue Pill circuitry. You have two options how to wire it all up.
 The minimal one, which consists of a GND->SWS_GND, PB0->SWS_VCC, A7->\[750R\]->A6, A6->SWS_SWS
 
@@ -52,9 +56,6 @@ Example of wiring up a Tuya outlet through the SWS interface:
 
 <img width="1008" height="756" alt="image" src="doc/bluepill-front_pins.jpg" />
 
-The GUI looks like this:
-
-<img width="948" height="696" alt="image" src="doc/programmer_GUI.png" />
 
 ## Repository content
 
