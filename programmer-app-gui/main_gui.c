@@ -669,6 +669,13 @@ static int need_target(void)
         ui_log("! %s", tlsr_last_error());
         return 0;
     }
+    /* ensure_target may have just switched the rails on, and the operation that
+     * follows can run for half a minute.  The end-of-job refresh in
+     * worker_main() would leave the power button showing "off" for all of it,
+     * directly contradicting the "target was off - powering up" line already in
+     * the log.  Publishing here costs one cheap round trip and makes the button
+     * agree with the log at the moment the log makes the claim. */
+    publish_rails();
     return 1;
 }
 
