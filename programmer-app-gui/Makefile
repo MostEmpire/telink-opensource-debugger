@@ -27,7 +27,7 @@ BUILD   = build
 TARGET  = $(BINDIR)/programmer_gui.exe
 
 CORE_HDR = $(CORE_DIR)/tlsr_core.h $(CORE_DIR)/tlsr_internal.h \
-           $(CORE_DIR)/tlsr_debug.h
+           $(CORE_DIR)/tlsr_debug.h $(CORE_DIR)/version.h
 OBJ      = $(BUILD)/main_gui.o $(BUILD)/tlsr_serial.o $(BUILD)/tlsr_bridge.o \
            $(BUILD)/tlsr_flash.o $(BUILD)/tlsr_debug.o $(BUILD)/app.res
 
@@ -45,11 +45,12 @@ $(BUILD)/%.o: $(CORE_DIR)/%.c $(CORE_HDR) | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # Manifest resource: asks for comctl32 v6 so the controls are themed.
-# Also carries the debugger toolbar icons, so a redrawn .ico rebuilds it.
+# Also carries the debugger toolbar icons, so a redrawn .ico rebuilds it, and
+# the version block -- hence -I$(CORE_DIR), where version.h lives.
 ICONS = $(wildcard icons/*.ico)
 
-$(BUILD)/app.res: app.rc res.h $(ICONS) | $(BUILD)
-	$(WINDRES) $< -O coff -o $@
+$(BUILD)/app.res: app.rc res.h $(CORE_DIR)/version.h $(ICONS) | $(BUILD)
+	$(WINDRES) -I$(CORE_DIR) $< -O coff -o $@
 
 $(BUILD):
 	-mkdir $(BUILD)

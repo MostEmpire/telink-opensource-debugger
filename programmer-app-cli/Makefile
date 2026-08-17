@@ -14,6 +14,7 @@
 # ever left next to the sources.
 
 CC      = gcc
+WINDRES = windres
 CFLAGS  ?= -O2 -Wall -Wextra -std=c99
 LDFLAGS ?=
 LDLIBS  ?= -ladvapi32
@@ -25,8 +26,8 @@ TARGET  = $(BINDIR)/programmer_cli.exe
 # tlsr_*.c are the shared protocol core; the GUI compiles these same files.
 CORE    = tlsr_serial.c tlsr_bridge.c tlsr_flash.c tlsr_debug.c
 SRC     = $(CORE) main_cli.c
-OBJ     = $(addprefix $(BUILD)/,$(SRC:.c=.o))
-HDR     = tlsr_core.h tlsr_internal.h tlsr_debug.h
+OBJ     = $(addprefix $(BUILD)/,$(SRC:.c=.o)) $(BUILD)/app.res
+HDR     = tlsr_core.h tlsr_internal.h tlsr_debug.h version.h
 
 all: $(TARGET)
 
@@ -36,13 +37,17 @@ $(TARGET): $(OBJ)
 $(BUILD)/%.o: %.c $(HDR) | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+# Version block only, so the exe answers for itself in Properties -> Details.
+$(BUILD)/app.res: app.rc version.h | $(BUILD)
+	$(WINDRES) $< -O coff -o $@
+
 $(BUILD):
 	-mkdir $(BUILD)
 
 # Only the intermediates.  ../bin holds the released binaries and is tracked,
 # so `clean` deliberately leaves it alone.
 clean:
-	-del /Q $(BUILD)\*.o 2>NUL
+	-del /Q $(BUILD)\*.o $(BUILD)\*.res 2>NUL
 	-rmdir $(BUILD) 2>NUL
 
 .PHONY: all clean

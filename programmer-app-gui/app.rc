@@ -11,6 +11,7 @@
  */
 #include <winuser.h>
 #include "res.h"
+#include "version.h"          /* ../programmer-app-cli, via windres -I */
 
 #ifndef RT_MANIFEST
 #define RT_MANIFEST 24
@@ -20,6 +21,38 @@
 #endif
 
 CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "app.manifest"
+
+/* Version block, so the exe answers for itself in Properties -> Details.
+ * `1 VERSIONINFO` is VS_VERSION_INFO spelled numerically -- the symbol lives in
+ * winver.h and its value is 1. */
+1 VERSIONINFO
+FILEVERSION    APP_VER_FILE
+PRODUCTVERSION APP_VER_FILE
+FILEFLAGSMASK  0x3fL
+FILEFLAGS      0x0L
+FILEOS         0x40004L        /* VOS_NT_WINDOWS32 */
+FILETYPE       0x1L            /* VFT_APP          */
+FILESUBTYPE    0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"       /* US English, Unicode */
+        BEGIN
+            VALUE "CompanyName",      APP_COMPANY
+            VALUE "FileDescription",  "Telink TLSR825x programmer"
+            VALUE "FileVersion",      APP_VERSION
+            VALUE "InternalName",     "programmer_gui"
+            VALUE "LegalCopyright",   APP_COPYRIGHT
+            VALUE "OriginalFilename", "programmer_gui.exe"
+            VALUE "ProductName",      APP_PRODUCT
+            VALUE "ProductVersion",   APP_VERSION
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
 
 /* Debugger toolbar icons.  Multi-size .ico so LoadImage() can ask for 24 or 32
  * and get a purpose-drawn bitmap rather than a resampled one. */
@@ -35,3 +68,8 @@ IDI_D_RUNCUR    ICON "icons/run_to_cursor.ico"
 IDI_D_BPTOGGLE  ICON "icons/bp_toggle.ico"
 IDI_D_BPCLEAR   ICON "icons/bp_remove_all.ico"
 IDI_D_REFRESH   ICON "icons/refresh.ico"
+
+/* Target power button.  Same drawing twice, differing only in the bolt colour,
+ * so the two states read as one control changing rather than two controls. */
+IDI_PWR_ON      ICON "icons/power_on.ico"
+IDI_PWR_OFF     ICON "icons/power_off.ico"

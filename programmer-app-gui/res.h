@@ -24,4 +24,9 @@
 #define IDI_D_BPCLEAR    210
 #define IDI_D_REFRESH    211
 
+/* Target power button, in the top bar.  Two states of one drawing: the bolt is
+ * green when the target is powered and dull red when it is not. */
+#define IDI_PWR_ON       220
+#define IDI_PWR_OFF      221
+
 #endif

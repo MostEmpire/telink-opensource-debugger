@@ -18,6 +18,7 @@
 
 #include "tlsr_core.h"
 #include "tlsr_debug.h"
+#include "version.h"
 
 #define PROG "programmer_cli"
 
@@ -63,7 +64,9 @@ static int fail(const char *what)
 static void usage(void)
 {
     printf(
-"%s - Telink TLSR825x programmer over the Blue Pill SWire bridge\n"
+/* APP_VERSION is a string literal, so it concatenates into the format and
+ * leaves the %s count -- and the PROG list at the bottom -- untouched. */
+"%s " APP_VERSION " - Telink TLSR825x programmer over the Blue Pill SWire bridge\n"
 "\n"
 "USAGE\n"
 "  %s -p PORT ACTION [OPTIONS]\n"
@@ -71,6 +74,7 @@ static void usage(void)
 "CONNECTION\n"
 "  -p, --port PORT        bridge COM port, e.g. COM10\n"
 "      --list             list COM ports and exit\n"
+"      --version          print the version and exit\n"
 "\n"
 "ACTIONS\n"
 "      --info             identify bridge and target, print capabilities\n"
@@ -353,6 +357,12 @@ int main(int argc, char **argv)
             } while (0)
 
         if      (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(); return 0; }
+        /* Like --help and --list, this answers before a port is demanded, and
+         * before the generic "--xxx is an action" branch could claim it. */
+        else if (!strcmp(a, "--version")) {
+            printf("%s %s\n", PROG, APP_VERSION);
+            return 0;
+        }
         else if (!strcmp(a, "-q") || !strcmp(a, "--quiet")) g_quiet = 1;
         /* Stage switches, not actions -- they must be tested before the
          * generic "--xxx is an action" branch below would swallow them. */

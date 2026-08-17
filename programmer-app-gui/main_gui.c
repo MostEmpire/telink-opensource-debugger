@@ -30,12 +30,18 @@
 #include "tlsr_core.h"
 #include "tlsr_debug.h"
 #include "res.h"
+#include "version.h"
 
-#define APP_TITLE "TLSR825x Programmer"
+/* APP_TITLE captions the message boxes, where a version number would just be
+ * noise repeated on every prompt.  APP_CAPTION carries it where it belongs:
+ * the title bar and the first line of the log, which is what someone reads
+ * when asked "which build are you running?". */
+#define APP_TITLE   "TLSR825x Programmer"
+#define APP_CAPTION APP_TITLE " " APP_VERSION
 
 /* ---------------------------------------------------------- control ids --- */
 enum {
-    IDC_PORT = 1000, IDC_RESCAN, IDC_CONNECT, IDC_STATUS, IDC_POWERLBL,
+    IDC_PORT = 1000, IDC_RESCAN, IDC_CONNECT, IDC_STATUS, IDC_POWER,
     IDC_PROGRESS, IDC_VERDICT, IDC_TABS, IDC_LOG,
 
     IDC_T_PROBE = 1100, IDC_T_PWRON, IDC_T_PWROFF, IDC_T_HALT, IDC_T_RUN,
@@ -116,6 +122,10 @@ static unsigned g_verdict_seq;
 /* --- debugger state.  Written by the worker, read by the UI thread after a
  * WM_APP+2; the values are plain words so a torn read is not possible. */
 static HWND      g_tip;                    /* shared tooltip control          */
+
+/* The two faces of the target-power button, loaded once and swapped as the
+ * rails change.  Owned for the life of the process, so they are never freed. */
+static HICON     g_ico_pwr_on, g_ico_pwr_off;
 static tlsr_regs g_dbg;                    /* .valid says the read worked     */
 static int       g_dbg_halted;
 static int       g_dbg_bp_armed;
@@ -378,6 +388,23 @@ static void add_tip(HWND c, const char *tip)
     ti.uId      = (UINT_PTR)c;
     ti.lpszText = (LPSTR)tip;
     SendMessageA(g_tip, TTM_ADDTOOLA, 0, (LPARAM)&ti);
+}
+
+/* Replace the text of a tip already registered by add_tip().  The power button
+ * is icon-only and replaced a label that named the live rails, so the tip is
+ * where that detail went; a static string could not carry it. */
+static void set_tip(HWND c, const char *text)
+{
+    TOOLINFOA ti;
+    if (!g_tip || !c)
+        return;
+    memset(&ti, 0, sizeof ti);
+    ti.cbSize   = sizeof ti;
+    ti.uFlags   = TTF_IDISHWND | TTF_SUBCLASS;
+    ti.hwnd     = g_main;
+    ti.uId      = (UINT_PTR)c;
+    ti.lpszText = (LPSTR)text;
+    SendMessageA(g_tip, TTM_UPDATETIPTEXTA, 0, (LPARAM)&ti);
 }
 
 static HWND mk_iconbtn(int resid, int x, int y, int id, const char *tip)
@@ -1906,22 +1933,33 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l)
         verdict_tick(verdict, vseq);
 
         /* The rail state is whatever the worker last observed, so an operation
-         * that powered the target up on our behalf is reflected here too. */
+         * that powered the target up on our behalf is reflected here too --
+         * this is the one place the button's face is decided, which is why it
+         * follows a power-up the user never asked for as readily as a click. */
         {
             static int shown = -2;
             if (rails != shown) {
-                char s[64];
+                HWND b = GetDlgItem(h, IDC_POWER);
+                int  live = (g_dev && rails >= 0);
+                char s[96];
+
                 shown = rails;
-                if (!g_dev || rails < 0)
-                    snprintf(s, sizeof s, "Device: not connected");
+                if (!live)
+                    snprintf(s, sizeof s, "Target power: not connected");
                 else if (rails == 0)
-                    snprintf(s, sizeof s, "Device: Powered off");
+                    snprintf(s, sizeof s, "Target is off - click to power it up");
                 else
-                    snprintf(s, sizeof s, "Device: Powered on (%s)",
+                    snprintf(s, sizeof s, "Target is powered (%s) - click to "
+                             "switch it off",
                              rails == TLSR_RAIL_PB0    ? "PB0" :
                              rails == TLSR_RAIL_MOSFET ? "MOSFET"
                                                        : "PB0+MOSFET");
-                set_text(IDC_POWERLBL, s);
+                EnableWindow(b, live);
+                SendMessageA(b, BM_SETIMAGE, IMAGE_ICON,
+                             (LPARAM)((live && rails) ? g_ico_pwr_on
+                                                      : g_ico_pwr_off));
+                set_tip(b, s);
+                InvalidateRect(b, NULL, TRUE);
             }
         }
         return 0;
@@ -2091,6 +2129,20 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l)
         switch (id) {
         case IDC_RESCAN:  fill_ports(); return 0;
         case IDC_CONNECT: do_connect(); return 0;
+
+        /* The icon says what the target is; the click asks for the opposite.
+         * Same job and same rail selection as the Target tab's pair, so the
+         * two routes cannot drift apart. */
+        case IDC_POWER: {
+            int on;
+            EnterCriticalSection(&g_lock);
+            on = (g_rails > 0);
+            LeaveCriticalSection(&g_lock);
+            g_job.flag = on ? 0 : 1;
+            g_job.len  = (uint32_t)cb_cur(IDC_B_RAIL);
+            submit(job_power);
+            return 0;
+        }
 
         case IDC_T_PROBE:  if (g_dev) submit(job_probe); return 0;
         case IDC_T_PWRON:
@@ -2309,7 +2361,18 @@ static void build_controls(void)
     mk_button("Rescan", 148, 8, 66, IDC_RESCAN);
     mk_button("Connect", 220, 8, 80, IDC_CONNECT);
     mk_static("disconnected", 310, 12, 150, IDC_STATUS);
-    mk_static("Device: not connected", 466, 12, 180, IDC_POWERLBL);
+    /* Target power: shows the rail state and switches it, in the place the
+     * "Device: ..." label used to sit.  A 32 px square sharing its top edge
+     * with the row's 24 px buttons, so it lines up with Rescan and Connect and
+     * nothing else in the top bar moves.  Being 8 px taller, it reaches y=40 --
+     * exactly TAB_TOP, so its last row is 39 and it still clears the tab strip.
+     * Both faces are loaded up front; WM_TIMER picks one. */
+    g_ico_pwr_on  = (HICON)LoadImageA(g_inst, MAKEINTRESOURCEA(IDI_PWR_ON),
+                                      IMAGE_ICON, 24, 24, LR_DEFAULTCOLOR);
+    g_ico_pwr_off = (HICON)LoadImageA(g_inst, MAKEINTRESOURCEA(IDI_PWR_OFF),
+                                      IMAGE_ICON, 24, 24, LR_DEFAULTCOLOR);
+    mk_iconbtn(IDI_PWR_OFF, 466, 8, IDC_POWER, "Target power");
+    EnableWindow(GetDlgItem(g_main, IDC_POWER), FALSE);
     /* PBM_SETBARCOLOR is ignored while the control is themed, and the manifest
      * asks for comctl32 v6, so theming comes off this one control -- otherwise
      * the bar stays system green whatever stage is running.
@@ -2584,7 +2647,7 @@ static void build_controls(void)
     ShowWindow(GetDlgItem(g_main, IDC_RESCAN), SW_SHOW);
     ShowWindow(GetDlgItem(g_main, IDC_CONNECT), SW_SHOW);
     ShowWindow(GetDlgItem(g_main, IDC_STATUS), SW_SHOW);
-    ShowWindow(GetDlgItem(g_main, IDC_POWERLBL), SW_SHOW);
+    ShowWindow(GetDlgItem(g_main, IDC_POWER), SW_SHOW);
     ShowWindow(GetDlgItem(g_main, IDC_PROGRESS), SW_SHOW);
 
     update_note(IDC_M_NOTE, REGION_SRAM, MODE_SIZE);
@@ -2636,7 +2699,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     wc.hIcon         = LoadIcon(NULL, IDI_APPLICATION);
     RegisterClassExA(&wc);
 
-    h = CreateWindowExA(0, wc.lpszClassName, APP_TITLE, WS_OVERLAPPEDWINDOW,
+    h = CreateWindowExA(0, wc.lpszClassName, APP_CAPTION, WS_OVERLAPPEDWINDOW,
                         CW_USEDEFAULT, CW_USEDEFAULT, 900, 640,
                         NULL, NULL, inst, NULL);
     if (!h)
@@ -2644,7 +2707,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     ShowWindow(h, show);
     UpdateWindow(h);
 
-    ui_log("%s - connect to the bridge, then use the tabs.", APP_TITLE);
+    ui_log("%s - connect to the bridge, then use the tabs.", APP_CAPTION);
     ui_log("The target board must be UNPLUGGED FROM MAINS if it is a mains "
            "device: such supplies are usually not isolated.");
     ui_log("Not every debug feature exists on this hardware.  Measured on a "

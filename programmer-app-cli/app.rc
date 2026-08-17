@@ -1,0 +1,44 @@
+/*
+ * app.rc - resources for programmer_cli.exe
+ *
+ * Copyright (C) 2026  telink_project contributors
+ * SPDX-License-Identifier: GPL-2.0-only
+ *
+ * Only a version block.  A console program needs no manifest and no icons, but
+ * it should still answer for itself in the Properties -> Details tab, which is
+ * where anyone handed a loose .exe looks first.
+ *
+ * `1 VERSIONINFO` rather than `VS_VERSION_INFO VERSIONINFO`: the symbol lives
+ * in winver.h and its value is 1, so spelling it numerically keeps windres from
+ * having to preprocess a system header for one constant.
+ */
+#include "version.h"
+
+1 VERSIONINFO
+FILEVERSION    APP_VER_FILE
+PRODUCTVERSION APP_VER_FILE
+FILEFLAGSMASK  0x3fL
+FILEFLAGS      0x0L
+FILEOS         0x40004L        /* VOS_NT_WINDOWS32 */
+FILETYPE       0x1L            /* VFT_APP          */
+FILESUBTYPE    0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"       /* US English, Unicode */
+        BEGIN
+            VALUE "CompanyName",      APP_COMPANY
+            VALUE "FileDescription",  "Telink TLSR825x programmer (command line)"
+            VALUE "FileVersion",      APP_VERSION
+            VALUE "InternalName",     "programmer_cli"
+            VALUE "LegalCopyright",   APP_COPYRIGHT
+            VALUE "OriginalFilename", "programmer_cli.exe"
+            VALUE "ProductName",      APP_PRODUCT
+            VALUE "ProductVersion",   APP_VERSION
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
