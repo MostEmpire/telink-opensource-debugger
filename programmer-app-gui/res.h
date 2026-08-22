@@ -23,6 +23,9 @@
 #define IDI_D_BPTOGGLE   209
 #define IDI_D_BPCLEAR    210
 #define IDI_D_REFRESH    211
+/* Start a debug session.  Leftmost in the toolbar, because in a detached
+ * session it is the only thing that can be pressed. */
+#define IDI_D_ATTACH     212
 
 /* Target power button, in the top bar.  Two states of one drawing: the bolt is
  * green when the target is powered and dull red when it is not. */

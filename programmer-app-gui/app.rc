@@ -68,6 +68,7 @@ IDI_D_RUNCUR    ICON "icons/run_to_cursor.ico"
 IDI_D_BPTOGGLE  ICON "icons/bp_toggle.ico"
 IDI_D_BPCLEAR   ICON "icons/bp_remove_all.ico"
 IDI_D_REFRESH   ICON "icons/refresh.ico"
+IDI_D_ATTACH    ICON "icons/debug_attach.ico"
 
 /* Target power button.  Same drawing twice, differing only in the bolt colour,
  * so the two states read as one control changing rather than two controls. */
