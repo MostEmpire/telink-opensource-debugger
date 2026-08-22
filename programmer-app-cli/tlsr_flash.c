@@ -34,15 +34,17 @@
 #include "tlsr_internal.h"
 
 /* ------------------------------------------------------------------- read -- */
-int tlsr_flash_read(tlsr_dev *d, uint32_t addr, uint8_t *out, uint32_t n,
-                    tlsr_progress_fn prog, void *user)
+/* The read loop on its own, with no halt in front.
+ *
+ * Split out because the halt is 0x0602 <- 0x05, which ends a debug session: the
+ * core comes back with PC = 0. During debugging the CPU is already held by the
+ * debug hold (0x06) and so cannot fight for the bus, which makes the halt
+ * unnecessary there. Callers that are not debugging want tlsr_flash_read(). */
+int tlsr_flash_read_nohalt(tlsr_dev *d, uint32_t addr, uint8_t *out, uint32_t n,
+                           tlsr_progress_fn prog, void *user)
 {
     uint32_t done = 0;
     int rc;
-
-    rc = tlsr_halt(d);
-    if (rc != TLSR_OK)
-        return rc;
 
     while (done < n) {
         uint8_t p[5];
@@ -188,6 +190,15 @@ int tlsr_flash_jedec(tlsr_dev *d, uint8_t out[3])
     return rc;
 }
 
+int tlsr_flash_read(tlsr_dev *d, uint32_t addr, uint8_t *out, uint32_t n,
+                    tlsr_progress_fn prog, void *user)
+{
+    int rc = tlsr_halt(d);
+    if (rc != TLSR_OK)
+        return rc;
+    return tlsr_flash_read_nohalt(d, addr, out, n, prog, user);
+}
+
 /* ------------------------------------------------------------------ erase -- */
 int tlsr_flash_erase(tlsr_dev *d, uint32_t addr, uint32_t len,
                      tlsr_progress_fn prog, tlsr_log_fn log, void *user)
@@ -311,8 +322,8 @@ int tlsr_flash_program_ex(tlsr_dev *d, uint32_t addr, const uint8_t *data,
     } else {
         /* Flash erases in whole sectors, so anything already living in the
          * sectors we touch has to be read out and written back or it is
-         * destroyed.  On these outlets that neighbouring data is the pairing
-         * and calibration records, which must survive a repair. */
+         * destroyed.  That neighbouring data is often the only copy of a
+         * board's pairing or calibration records, so it has to survive. */
         base       = addr - (addr % TLSR_FLASH_SECTOR);
         span       = ((n + (addr - base) + TLSR_FLASH_SECTOR - 1)
                       / TLSR_FLASH_SECTOR) * TLSR_FLASH_SECTOR;
@@ -493,7 +504,7 @@ int tlsr_identify(tlsr_dev *d, tlsr_info *info, tlsr_log_fn log, void *user)
     info->boot_marker = info->flash_head[0];
 
     /* Size is taken from the JEDEC capacity byte when it looks sane, otherwise
-     * we fall back to the 512 KB these outlets ship with. */
+     * we fall back to the 512 KB most parts in this family carry. */
     if (tlsr_flash_jedec(d, jedec) == TLSR_OK) {
         memcpy(info->flash_jedec, jedec, 3);
         info->flash_vendor = flash_vendor(jedec[0]);

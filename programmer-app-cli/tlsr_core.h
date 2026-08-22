@@ -205,6 +205,13 @@ int tlsr_reboot(tlsr_dev *d);
 int tlsr_ensure_target(tlsr_dev *d, tlsr_log_fn log, void *user);
 
 /* ------------------------------------------------------------------ flash --- */
+/* Same read, but without halting first. The halt is 0x0602 <- 0x05, which ends
+ * a debug session; during debugging the core is already held by 0x06 and cannot
+ * contend for the bus, so the halt is not needed. Use this from the debugger,
+ * tlsr_flash_read() from everywhere else. */
+int tlsr_flash_read_nohalt(tlsr_dev *d, uint32_t addr, uint8_t *out, uint32_t n,
+                           tlsr_progress_fn prog, void *user);
+
 int tlsr_flash_read(tlsr_dev *d, uint32_t addr, uint8_t *out, uint32_t n,
                     tlsr_progress_fn prog, void *user);
 int tlsr_flash_erase(tlsr_dev *d, uint32_t addr, uint32_t len,
