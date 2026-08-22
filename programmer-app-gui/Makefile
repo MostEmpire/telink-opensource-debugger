@@ -27,9 +27,10 @@ BUILD   = build
 TARGET  = $(BINDIR)/programmer_gui.exe
 
 CORE_HDR = $(CORE_DIR)/tlsr_core.h $(CORE_DIR)/tlsr_internal.h \
-           $(CORE_DIR)/tlsr_debug.h $(CORE_DIR)/version.h
+           $(CORE_DIR)/tlsr_debug.h $(CORE_DIR)/tlsr_dis.h $(CORE_DIR)/version.h
 OBJ      = $(BUILD)/main_gui.o $(BUILD)/tlsr_serial.o $(BUILD)/tlsr_bridge.o \
-           $(BUILD)/tlsr_flash.o $(BUILD)/tlsr_debug.o $(BUILD)/app.res
+           $(BUILD)/tlsr_flash.o $(BUILD)/tlsr_debug.o $(BUILD)/tlsr_dis.o \
+           $(BUILD)/app.res
 
 all: $(TARGET)
 

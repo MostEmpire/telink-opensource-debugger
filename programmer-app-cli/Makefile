@@ -24,10 +24,10 @@ BUILD   = build
 TARGET  = $(BINDIR)/programmer_cli.exe
 
 # tlsr_*.c are the shared protocol core; the GUI compiles these same files.
-CORE    = tlsr_serial.c tlsr_bridge.c tlsr_flash.c tlsr_debug.c
+CORE    = tlsr_serial.c tlsr_bridge.c tlsr_flash.c tlsr_debug.c tlsr_dis.c
 SRC     = $(CORE) main_cli.c
 OBJ     = $(addprefix $(BUILD)/,$(SRC:.c=.o)) $(BUILD)/app.res
-HDR     = tlsr_core.h tlsr_internal.h tlsr_debug.h version.h
+HDR     = tlsr_core.h tlsr_internal.h tlsr_debug.h tlsr_dis.h version.h
 
 all: $(TARGET)
 
