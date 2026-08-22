@@ -22,6 +22,24 @@ struct tlsr_dev {
     int      activated;    /* target has answered since we connected     */
     tlsr_stage_fn stage_cb;
     void         *stage_user;
+
+    /* --- debugger state, see tlsr_debug.h ---------------------------- */
+    const uint8_t *code;   /* borrowed image of what was flashed, for      */
+    uint32_t  code_len;    /* working out where an instruction goes next   */
+    uint32_t  code_base;
+    tlsr_cfg  dbg_saved;   /* bridge timing to restore on detach           */
+    int       dbg_saved_ok;
+    int       dbg_attached; /* a debug session is open                     */
+    int       dbg_powered;  /* we powered the target without activating it */
+
+    /* The four hardware comparators, mirrored in software.  Mirrored rather
+     * than read back because the debugger's own operations borrow a slot, and
+     * because a session outlives one CLI invocation -- tlsr_dbg_bp_sync()
+     * pushes this list back into the chip whenever that is in doubt. */
+    uint32_t  dbg_bp[4];
+    uint8_t   dbg_bp_used[4];
+    uint32_t  dbg_anchor;   /* address in the reserved comparator          */
+    uint8_t   dbg_anchor_on;
 };
 
 /* Announce which phase the core has entered.  Silent when no front end asked. */

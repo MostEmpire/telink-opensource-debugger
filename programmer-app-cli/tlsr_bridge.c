@@ -19,6 +19,7 @@
 
 #include "tlsr_core.h"
 #include "tlsr_internal.h"
+#include "tlsr_debug.h"   /* the SWire dividers a debug session switches between */
 
 static const char *status_text(uint8_t st)
 {
@@ -382,11 +383,30 @@ int tlsr_ensure_target(tlsr_dev *d, tlsr_log_fn log, void *user)
 {
     uint8_t rails = 0;
     uint16_t chip = 0;
+    tlsr_cfg c;
     int rc;
 
-    rc = tlsr_get_cfg(d, NULL, &rails);
+    rc = tlsr_get_cfg(d, &c, &rails);
     if (rc != TLSR_OK)
         return rc;
+
+    /*
+     * A debug session leaves the bridge on the doubled SWire divider, because
+     * that is what a target running its own 48 MHz firmware needs.  Everything
+     * in here is the programming path, which activates and therefore talks to a
+     * target caught at boot running at 24 MHz -- at the wrong divider every byte
+     * comes back shifted one bit, and the symptom is a confident-looking chip id
+     * of 0xFF62 rather than an error.  A session that ended abruptly (the app
+     * closed mid-debug) would otherwise leave every later operation broken with
+     * no clue why, so put the timing back rather than diagnosing it.
+     */
+    if (c.spi_div == TLSR_DBG_LIVE_SPI_DIV) {
+        TLSR_LOG(log, user, "the bridge was left on the debug SWire divider; "
+                 "restoring the programming one");
+        c.spi_div = TLSR_DBG_PROG_SPI_DIV;
+        tlsr_set_cfg(d, &c);
+        d->activated = 0;
+    }
 
     if (!rails) {
         TLSR_LOG(log, user, "target was off - powering up");
@@ -415,8 +435,8 @@ int tlsr_ensure_target(tlsr_dev *d, tlsr_log_fn log, void *user)
             return rc;
         if (!chip_id_stable(d, &chip)) {
             tlsr_set_error("target did not respond with a stable chip id. "
-                           "Check the SWS wiring, and that the outlet is "
-                           "unplugged from mains and powered by the bridge.");
+                           "Check the SWS wiring, and that the target is "
+                           "powered by the bridge.");
             d->activated = 0;
             return TLSR_E_TARGET;
         }

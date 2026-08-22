@@ -94,16 +94,45 @@ static void usage(void)
 "      --cfg              print the bridge's SWire timing\n"
 "      --set-cfg K=V,..   change it, e.g. --set-cfg spi_div=2,cell=6\n"
 "\n"
-"DEBUGGER (see the note under --regs; this chip does not answer)\n"
+"DEBUGGER\n"
+"  Debugging needs the firmware RUNNING, which every other action here goes out\n"
+"  of its way to prevent: activation catches the chip before it boots, and that\n"
+"  state survives a soft reset.  So power the target WITHOUT activating it and\n"
+"  then open a session:\n"
+"      --dbg-power-on     power the target, no activation, firmware boots\n"
+"      --dbg-power-off    cut the rails\n"
+"      --dbg-attach       open a session on the running firmware\n"
+"      --dbg-detach       close it: comparators cleared, core running, bridge\n"
+"                         back on its programming divider\n"
+"      --dbg-reset        reboot the core without closing the session\n"
+"      --dbg-status       what state the target is in and what that allows\n"
 "      --regs             dump the CPU register file\n"
-"      --stall            debug-halt the core (0x0602 <- 0x06)\n"
-"      --continue         resume with the breakpoint comparator live\n"
+"      --halt-core        hold the core (leaky - prefer a breakpoint)\n"
+"      --resume           let it run again\n"
+"      --bp ADDR          add or remove a breakpoint at ADDR\n"
+"      --bp list|off      list them, or remove them all\n"
+"      --runto ADDR       run until the PC reaches ADDR, then hold\n"
 "      --step [N]         execute N instructions, default 1\n"
-"      --step-over        step, but run through a call rather than into it\n"
+"      --step-into        one instruction, entering any call\n"
+"      --step-over        one instruction, running any call to completion\n"
 "      --step-out         run to the address in LR (finish this function)\n"
-"      --bp ADDR|off      arm or clear the hardware breakpoint\n"
-"      --runto ADDR       resume and wait for the PC to reach ADDR\n"
-"      --dbg-probe        report whether the CPU debug block answers at all\n"
+"      --stack [N]        dump N bytes of stack at SP           (default 64)\n"
+"      --profile [N]      sample the PC N times while running   (default 200)\n"
+"\n"
+"  The actions leave the target running between invocations, so a session\n"
+"  spans several commands.\n"
+"\n"
+"  There are THREE hardware breakpoints.  The chip has four address\n"
+"  comparators and the debugger keeps one for itself: nothing else holds a\n"
+"  stopped core on this part, so being stopped means sitting on a comparator.\n"
+"  That reserved slot is also what --runto, --step-over and --step-out use, so\n"
+"  none of them costs you a breakpoint.\n"
+"\n"
+"  Stepping is real hardware stepping, using Telink's own 0x0602/0x0613\n"
+"  sequence, so it follows branches and calls.  A step that lands on the IRQ\n"
+"  vector is finished by running the handler out to LR, which is where the step\n"
+"  was heading anyway, so interrupt-heavy firmware still steps one instruction\n"
+"  at a time.  --code is optional: instructions are read straight off the chip.\n"
 "\n"
 "OPTIONS\n"
 "  -f, --file PATH        binary file for --dump/--flash/--verify\n"
@@ -113,6 +142,9 @@ static void usage(void)
 "      --region NAME      flash | sram | reg          (--read/--write, default flash)\n"
 "      --rail both|pb0|mosfet    which supply to switch          (default both)\n"
 "      --timeout MS       how long --runto waits               (default 5000)\n"
+"      --code PATH        image that was flashed, so --step-* can work out\n"
+"                         where the next instruction is\n"
+"      --code-base ADDR   address --code starts at                (default 0)\n"
 "      --frames N         activation frames for --activate       (default 600)\n"
 "      --no-erase         --flash: skip the erase stage.  Expert: NOR flash\n"
 "                         only clears bits, so the sectors must be erased\n"
@@ -127,7 +159,11 @@ static void usage(void)
 "  %s -p COM10 --flash -f image.bin --offset 0x1000 -n 0x1000 -a 0x1000\n"
 "  %s -p COM10 --read -a 0x040000 -n 64 --region sram\n"
 "  %s -p COM10 --write \"DE AD BE EF\" -a 0x040000 --region sram\n"
-"  %s -p COM10 --dbg-probe\n"
+"  %s -p COM10 --dbg-power-on\n"
+"  %s -p COM10 --dbg-attach\n"
+"  %s -p COM10 --runto 0x140C\n"
+"  %s -p COM10 --regs --stack 64\n"
+"  %s -p COM10 --dbg-detach\n"
 "\n"
 "SAFETY\n"
 "  If the target is a mains device, it must be unplugged from mains.  Such\n"
@@ -135,7 +171,8 @@ static void usage(void)
 "  programmer while live is dangerous.\n",
     /* One PROG per %s above: the program name, the USAGE line, and one per
      * example.  Keep these in step when editing the help text. */
-    PROG, PROG, PROG, PROG, PROG, PROG, PROG, PROG, PROG);
+    PROG, PROG, PROG, PROG, PROG, PROG, PROG, PROG, PROG, PROG, PROG, PROG,
+    PROG);
 }
 
 /* ---------------------------------------------------------------- helpers -- */
@@ -225,9 +262,13 @@ static void print_info(const tlsr_info *in)
     printf("swire div   : 0x%02X\n", in->swire_div);
     printf("flash[0..15]: %s\n", tlsr_hex(hex, sizeof hex, in->flash_head, 16));
     printf("\nsupported   : halt/resume/reset, read+write registers and SRAM,\n"
-           "              read/erase/program flash, target power control\n");
-    printf("unsupported : PC readback, r0-r14, single-step, breakpoints\n"
-           "              (not exposed by this chip's SWire interface)\n");
+           "              read/erase/program flash, target power control,\n"
+           "              debugging: PC, r0-r15/psr at a breakpoint, hardware\n"
+           "              breakpoints, run-to, stack, PC profiling\n");
+    printf("unsupported : single instruction step (0x0613 does not move the PC\n"
+           "              on this part; --step-* are built on breakpoints)\n");
+    printf("\n  Debugging needs the firmware running, which --info deliberately\n"
+           "  prevents. Start a session with --dbg-attach, see --dbg-status.\n");
 }
 
 /* ------------------------------------------------------- bridge timing --- */
@@ -305,18 +346,6 @@ static int parse_cfg_spec(const char *spec, tlsr_cfg *c)
 }
 
 /* ------------------------------------------------------------ debugger --- */
-/* Printed before any debug action, because on the TLSR8253 in these outlets
- * the block does not answer and a wall of zeros otherwise reads like a bug in
- * this tool rather than a property of the chip. */
-static void dbg_note(void)
-{
-    if (g_quiet)
-        return;
-    printf("note: the CPU debug block (0x0610/0x0613/0x0680) is pvvx's map for\n"
-           "      TLSR825x.  Measured on TLSR8253 it does not answer - see\n"
-           "      --dbg-probe.  Zeros below mean the chip, not a failed read.\n");
-}
-
 static void print_regs(const tlsr_regs *r)
 {
     int i;
@@ -326,6 +355,130 @@ static void print_regs(const tlsr_regs *r)
     printf("  %-9s 0x%08X  (mul32*32)>>32\n",
            tlsr_dbg_reg_name(TLSR_DBG_IDX_M64),
            (unsigned)r->r[TLSR_DBG_IDX_M64]);
+    if (!r->full)
+        printf("\n  sp, lr and psr are only latched when the core stops at a\n"
+               "  breakpoint.  The zeros above are that, not a failed read.\n");
+}
+
+static const struct { unsigned bit; const char *name; } g_caps[] = {
+    { TLSR_CAP_MEM_READ,   "read registers and SRAM" },
+    { TLSR_CAP_MEM_WRITE,  "write registers and SRAM" },
+    { TLSR_CAP_FLASH,      "read/erase/program flash" },
+    { TLSR_CAP_PC,         "read the PC" },
+    { TLSR_CAP_REGS_FULL,  "read r0-r15 and psr" },
+    { TLSR_CAP_HALT,       "--halt-core" },
+    { TLSR_CAP_RESUME,     "--resume" },
+    { TLSR_CAP_BREAKPOINT, "--bp" },
+    { TLSR_CAP_RUN_TO,     "--runto" },
+    { TLSR_CAP_ATTACH,     "--dbg-attach" },
+    { TLSR_CAP_DETACH,     "--dbg-detach" },
+    { TLSR_CAP_RESET,      "--dbg-reset" },
+    { TLSR_CAP_STEP_INTO,  "--step-into" },
+    { TLSR_CAP_STEP_OVER,  "--step-over" },
+    { TLSR_CAP_STEP_OUT,   "--step-out" },
+    { TLSR_CAP_STACK,      "--stack" },
+    { TLSR_CAP_PROFILE,    "--profile" },
+    { TLSR_CAP_STEP_INSN,  "--step" },
+    { 0, NULL }
+};
+
+/* What to tell the user to do next, given where they are. The point of the
+ * state machine is that "not available" always comes with a way forward. */
+static const char *dbg_next_step(const tlsr_dbg_status *s)
+{
+    switch (s->state) {
+    case TLSR_DBG_NO_TARGET:
+        return "Nothing is answering. Check that the target is powered by\n"
+               "  the bridge (--power on), then --info to re-open the link.";
+    case TLSR_DBG_POWER_OFF:
+        return "The bridge is not powering the target. --dbg-power-on boots it\n"
+               "  without activating, which is the only way the firmware runs.";
+    case TLSR_DBG_ON_BOOT:
+        return "The target is powered and running its firmware, but the bridge\n"
+               "  is still on the programming divider, so the chip cannot be\n"
+               "  read. Run --dbg-attach to open a session.";
+    case TLSR_DBG_BOOT_HELD:
+        return "The core was caught before the firmware ran, which is what the\n"
+               "  programmer wants but not what a debugger wants.\n"
+               "  Run --dbg-attach to boot it and open a debug session.";
+    case TLSR_DBG_RUNNING:
+        return "Firmware is running. --halt-core holds it, or --runto ADDR\n"
+               "  stops it somewhere useful and latches the registers.";
+    case TLSR_DBG_HELD:
+        return "The core is held. The PC is trustworthy; whether sp/lr/psr are\n"
+               "  too is listed above -- if not, --runto ADDR latches them.";
+    case TLSR_DBG_AT_BREAKPOINT:
+        return "Stopped at a breakpoint with the full register file valid.";
+    }
+    return "";
+}
+
+static void print_dbg_status(const tlsr_dbg_status *s)
+{
+    int i;
+    printf("target state: %s\n", tlsr_dbg_state_name(s->state));
+    printf("  target power: %s   debugger: %s   bridge timing: %s\n",
+           s->powered ? "on" : "off", s->attached ? "attached" : "detached",
+           s->live_timing ? "live (spi_div=1)" : "default");
+    if (s->attached && s->state != TLSR_DBG_NO_TARGET)
+        printf("  CLKSET 0x%02X (%s)\n", s->clkset,
+               s->clkset != TLSR_CLKSET_RESET ? "firmware has set the clock"
+                                              : "reset value, firmware has not run");
+    if (s->caps & TLSR_CAP_PC)
+        printf("  PC 0x%06X   core is %s\n", (unsigned)(s->pc & 0xFFFFFF),
+               s->halted ? "held" : "executing");
+    printf("  breakpoints: %d of %d used\n", s->nbp, TLSR_DBG_NBP);
+    for (i = 0; i < s->nbp; i++)
+        printf("    [%d] 0x%06X%s\n", i, (unsigned)(s->bp[i] & 0xFFFFFF),
+               i == s->bp_hit ? "   <- stopped here" : "");
+    printf("  code image: %s\n", s->have_code
+           ? "loaded" : "none (not needed - code is read off the chip)");
+
+    printf("\navailable now:\n");
+    for (i = 0; g_caps[i].name; i++)
+        if (s->caps & g_caps[i].bit)
+            printf("    %s\n", g_caps[i].name);
+    printf("not available here:\n");
+    for (i = 0; g_caps[i].name; i++)
+        if (!(s->caps & g_caps[i].bit))
+            printf("    %s\n", g_caps[i].name);
+    printf("\n  %s\n", dbg_next_step(s));
+}
+
+/* Debugger actions must not go through tlsr_ensure_target(): activating is
+ * precisely what stops the firmware from running. */
+static int is_dbg_action(const char *a)
+{
+    static const char *const names[] = {
+        "dbg-attach", "dbg-detach", "dbg-status", "dbg-reset",
+        "dbg-power-on", "dbg-power-off", "regs", "halt-core",
+        "resume", "bp", "runto", "step", "step-into", "step-over", "step-out",
+        "stack", "profile", NULL
+    };
+    int i;
+    for (i = 0; names[i]; i++)
+        if (!strcmp(a, names[i]))
+            return 1;
+    return 0;
+}
+
+/* Read a whole file so --step-* can decode the instruction at the PC. */
+static uint8_t *slurp(const char *path, uint32_t *len)
+{
+    FILE *f = fopen(path, "rb");
+    long n;
+    uint8_t *b;
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (n <= 0) { fclose(f); return NULL; }
+    b = (uint8_t *)malloc((size_t)n);
+    if (!b) { fclose(f); return NULL; }
+    if (fread(b, 1, (size_t)n, f) != (size_t)n) { free(b); fclose(f); return NULL; }
+    fclose(f);
+    *len = (uint32_t)n;
+    return b;
 }
 
 /* ------------------------------------------------------------------- main -- */
@@ -340,6 +493,10 @@ int main(int argc, char **argv)
     int i, rc = 0;
     uint8_t rail = TLSR_RAIL_BOTH;
     tlsr_dev *d = NULL;
+    const char *code_path = NULL;
+    uint32_t code_base = 0;
+    uint8_t *code_img = NULL;
+    uint32_t code_len = 0;
 
     if (argc < 2) {
         usage();
@@ -381,15 +538,34 @@ int main(int argc, char **argv)
             if (parse_num(v, &addr)) { fprintf(stderr, "%s: bad address '%s'\n", PROG, v); return 1; }
             action = "runto";
         }
-        /* --step takes an optional count, so only swallow the next argument
-         * when it is a number rather than the next switch. */
+        /* --step, --stack and --profile take an optional count, so only swallow
+         * the next argument when it is a number rather than the next switch. */
         else if (!strcmp(a, "--step")) {
             action = "step";
+            steps = 1;
             if (i + 1 < argc && argv[i + 1][0] != '-') {
                 if (parse_num(argv[++i], &steps) || !steps) {
                     fprintf(stderr, "%s: bad step count '%s'\n", PROG, argv[i]);
                     return 1;
                 }
+            }
+        }
+        else if (!strcmp(a, "--stack") || !strcmp(a, "--profile")) {
+            action = a + 2;
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                if (parse_num(argv[++i], &steps) || !steps) {
+                    fprintf(stderr, "%s: bad count '%s'\n", PROG, argv[i]);
+                    return 1;
+                }
+            } else {
+                steps = !strcmp(a, "--stack") ? 64u : 200u;
+            }
+        }
+        else if (!strcmp(a, "--code")) NEXT(code_path);
+        else if (!strcmp(a, "--code-base")) {
+            const char *v; NEXT(v);
+            if (parse_num(v, &code_base)) {
+                fprintf(stderr, "%s: bad code base '%s'\n", PROG, v); return 1;
             }
         }
         else if (!strcmp(a, "--timeout")) {
@@ -516,9 +692,56 @@ int main(int argc, char **argv)
         goto done;
     }
 
-    /* ---- everything below needs a live target --------------------------- */
-    rc = tlsr_ensure_target(d, cli_log, NULL);
-    if (rc != TLSR_OK) { rc = fail("target"); goto done; }
+    /* ---- everything below needs a live target ---------------------------
+     * ...except the debugger, which needs the opposite. tlsr_ensure_target()
+     * activates, activation catches the chip in the post-reset window, and the
+     * firmware then never runs -- so a debug session would be looking at a
+     * target that is doing nothing. Debug actions talk to whatever is there. */
+    if (code_path) {
+        code_img = slurp(code_path, &code_len);
+        if (!code_img) {
+            fprintf(stderr, "%s: cannot read --code '%s'\n", PROG, code_path);
+            rc = 1; goto done;
+        }
+        tlsr_dbg_set_code(d, code_img, code_len, code_base);
+        if (!g_quiet)
+            printf("code image: %s, %u bytes at 0x%06X\n", code_path,
+                   (unsigned)code_len, (unsigned)code_base);
+    }
+
+    if (!is_dbg_action(action)) {
+        rc = tlsr_ensure_target(d, cli_log, NULL);
+        if (rc != TLSR_OK) { rc = fail("target"); goto done; }
+    }
+
+    /* Everything except opening, closing and reporting a session needs an open
+     * session. Refuse rather than print zeros: saying which step is missing is
+     * more useful than a wall of 0x0. */
+    if (is_dbg_action(action) &&
+        strcmp(action, "dbg-attach")    && strcmp(action, "dbg-detach") &&
+        strcmp(action, "dbg-status")    && strcmp(action, "dbg-power-on") &&
+        strcmp(action, "dbg-power-off")) {
+        tlsr_dbg_status st;
+        if (tlsr_dbg_status_read(d, &st) == TLSR_OK) {
+            const char *why = NULL;
+            switch (st.state) {
+            case TLSR_DBG_POWER_OFF:
+                why = "the target is not powered. Run --dbg-power-on, then "
+                      "--dbg-attach."; break;
+            case TLSR_DBG_ON_BOOT:
+                why = "the target is running but no session is open. Run "
+                      "--dbg-attach first."; break;
+            case TLSR_DBG_BOOT_HELD:
+                why = "the core was caught before the firmware ran, so there is "
+                      "nothing to debug yet. Run --dbg-attach first."; break;
+            default: break;
+            }
+            if (why) {
+                fprintf(stderr, "%s: %s\n", PROG, why);
+                rc = 1; goto done;
+            }
+        }
+    }
 
     if (!strcmp(action, "info")) {
         tlsr_info in;
@@ -547,104 +770,219 @@ int main(int argc, char **argv)
         printf("SWire link is open (%u frames)\n", (unsigned)frames);
         rc = 0;
     }
-    else if (!strcmp(action, "dbg-probe")) {
-        int present = 0;
-        rc = tlsr_dbg_present(d, &present, cli_log, NULL);
-        if (rc != TLSR_OK) { rc = fail("dbg-probe"); goto done; }
-        printf("CPU debug block: %s\n", present ? "responds" : "no response");
-        if (!present)
-            printf("  0x0680 (register file) and 0x06BC (PC latch) both read\n"
-                   "  zero with the core held, so --regs, --step, --bp and\n"
-                   "  --runto have nothing to work with on this part.\n");
-        rc = present ? 0 : 1;
+    else if (!strcmp(action, "dbg-attach")) {
+        tlsr_dbg_status st;
+        rc = tlsr_dbg_attach(d, cli_log, NULL);
+        if (rc != TLSR_OK) { rc = fail("dbg-attach"); goto done; }
+        if (tlsr_dbg_status_read(d, &st) == TLSR_OK)
+            print_dbg_status(&st);
+        printf("\n  The target is left running and the bridge is left on the\n"
+               "  live divider, so the next invocation can carry on. Finish\n"
+               "  with --dbg-detach before using the programmer normally.\n");
+        rc = 0;
+    }
+    else if (!strcmp(action, "dbg-detach")) {
+        rc = tlsr_dbg_detach(d, cli_log, NULL);
+        if (rc != TLSR_OK) { rc = fail("dbg-detach"); goto done; }
+        printf("debug session closed; the core is running and the target is\n"
+               "still powered. The programmer actions activate for themselves.\n");
+        rc = 0;
+    }
+    else if (!strcmp(action, "dbg-status")) {
+        tlsr_dbg_status st;
+        rc = tlsr_dbg_status_read(d, &st);
+        if (rc != TLSR_OK) { rc = fail("dbg-status"); goto done; }
+        print_dbg_status(&st);
+        rc = (st.state == TLSR_DBG_NO_TARGET) ? 1 : 0;
     }
     else if (!strcmp(action, "regs")) {
         tlsr_regs r;
-        dbg_note();
-        /* Reads are only trustworthy with the core held; a running core makes
-         * every byte come back bit-shifted. */
-        if (tlsr_halt(d) != TLSR_OK) { rc = fail("halt"); goto done; }
         rc = tlsr_dbg_read_regs(d, &r);
         if (rc != TLSR_OK) { rc = fail("regs"); goto done; }
         print_regs(&r);
         rc = 0;
     }
-    else if (!strcmp(action, "stall")) {
-        dbg_note();
-        rc = tlsr_dbg_stall(d) == TLSR_OK ? 0 : fail("stall");
-        if (!rc) {
-            uint8_t st = 0;
-            printf("wrote 0x06 to 0x0602\n");
-            if (tlsr_read8(d, TLSR_REG_CPU_CTRL, &st) == TLSR_OK) {
-                printf("reads back 0x%02X - %s\n", st,
-                       st == TLSR_CPU_STALL ? "stalled"
-                                            : "NOT stalled, the write did not take");
-                if (st != TLSR_CPU_STALL)
-                    rc = 1;
-            }
+    else if (!strcmp(action, "halt-core")) {
+        tlsr_dbg_status st;
+        rc = tlsr_dbg_pause(d, NULL, cli_log, NULL) == TLSR_OK ? 0 : fail("halt-core");
+        if (!rc && tlsr_dbg_status_read(d, &st) == TLSR_OK) {
+            /* 0x0602 reads back 0x08 whatever we write, so report the halted
+             * flag rather than what the control register claims. */
+            printf("core is %s (PC 0x%06X)\n",
+                   st.state == TLSR_DBG_RUNNING ? "STILL RUNNING" : "held",
+                   (unsigned)(st.pc & 0xFFFFFF));
+            if (st.state == TLSR_DBG_RUNNING) rc = 1;
+            else
+                printf("  the stop is a comparator stop, so it persists between\n"
+                       "  invocations. --resume lets it go.\n");
         }
     }
-    else if (!strcmp(action, "continue")) {
-        dbg_note();
-        rc = tlsr_dbg_go(d) == TLSR_OK ? 0 : fail("continue");
-        if (!rc)
-            printf("running, breakpoint comparator live\n"
-                   "  with the core running SWire reads are unreliable, and the\n"
-                   "  firmware may take the SWS pad - recovering then needs a\n"
-                   "  power cycle and --activate\n");
-    }
-    else if (!strcmp(action, "step-over")) {
+    else if (!strcmp(action, "resume")) {
         tlsr_regs r;
-        dbg_note();
-        rc = tlsr_dbg_step_over(d, timeout_ms, &r, cli_log, NULL);
-        if (rc != TLSR_OK) { rc = fail("step-over"); goto done; }
-        printf("PC=0x%06X\n", (unsigned)(r.r[TLSR_DBG_IDX_PC] & 0xFFFFFF));
-        rc = 0;
-    }
-    else if (!strcmp(action, "step-out")) {
-        tlsr_regs r;
-        dbg_note();
-        rc = tlsr_dbg_step_out(d, timeout_ms, &r, cli_log, NULL);
-        if (rc != TLSR_OK) { rc = fail("step-out"); goto done; }
-        printf("PC=0x%06X\n", (unsigned)(r.r[TLSR_DBG_IDX_PC] & 0xFFFFFF));
-        rc = 0;
+        /*
+         * Resume AND WAIT, rather than resuming and exiting.
+         *
+         * Partly because it is more useful in a one-shot tool -- "run until
+         * something stops you" is what the next command wants to know about.
+         * But also because leaving the core running and then closing the port
+         * loses the comparators: the port close resets the bridge, and measured
+         * on the bench a target left running through that came back with the
+         * whole 0x0610 block zeroed, while a target stopped on a breakpoint came
+         * through untouched every time. Waiting for the stop keeps the session
+         * intact between commands.
+         */
+        if (tlsr_dbg_bp_count(d)) {
+            rc = tlsr_dbg_continue(d, timeout_ms, &r, cli_log, NULL);
+            if (rc == TLSR_OK) {
+                print_regs(&r);
+                rc = 0;
+            } else {
+                printf("%s\n", tlsr_last_error());
+                printf("\n  The core is still running. Closing the port now may\n"
+                       "  clear the breakpoints -- use --halt-core to bring it\n"
+                       "  to rest first.\n");
+                rc = 1;
+            }
+        } else {
+            rc = tlsr_dbg_resume(d) == TLSR_OK ? 0 : fail("resume");
+            if (!rc)
+                printf("core resumed (no breakpoints set, so nothing to wait "
+                       "for)\n");
+        }
     }
     else if (!strcmp(action, "step")) {
-        tlsr_regs r;
         uint32_t k;
-        dbg_note();
-        if (tlsr_dbg_stall(d) != TLSR_OK) { rc = fail("stall"); goto done; }
-        for (k = 0; k < steps; k++)
-            if (tlsr_dbg_step(d) != TLSR_OK) { rc = fail("step"); goto done; }
-        if (tlsr_dbg_read_regs(d, &r) != TLSR_OK) { rc = fail("regs"); goto done; }
+        tlsr_dbg_status sst;
+        /* Hold the core first if it is running. A 0x06 hold does not survive
+         * the port closing, so from a one-shot tool the core is always running
+         * again by the next invocation -- without this, "--step" would step a
+         * live target and every step would land somewhere unrelated. */
+        if (tlsr_dbg_status_read(d, &sst) == TLSR_OK &&
+            sst.state == TLSR_DBG_RUNNING) {
+            tlsr_dbg_halt(d);
+            Sleep(100);
+            if (!g_quiet)
+                printf("core was running; held it first\n");
+        }
+        for (k = 0; k < steps; k++) {
+            tlsr_regs sr;
+            int skipped = 0;
+            /* The core logs the transition itself, using the PC it actually
+             * stepped from. Recomputing it out here produced deltas that
+             * disagreed with what had really happened, because the core
+             * re-settles the PC before stepping. */
+            if (tlsr_dbg_step(d, &sr, &skipped, cli_log, NULL) != TLSR_OK) {
+                fprintf(stderr, "%s\n", tlsr_last_error());
+                rc = 1; goto done;
+            }
+        }
         printf("stepped %u instruction(s), PC=0x%06X\n", (unsigned)steps,
-               (unsigned)(r.r[TLSR_DBG_IDX_PC] & 0xFFFFFF));
+               (unsigned)(tlsr_dbg_read_pc(d) & 0xFFFFFF));
+        rc = 0;
+    }
+    else if (!strcmp(action, "step-into") || !strcmp(action, "step-over") ||
+             !strcmp(action, "step-out")) {
+        tlsr_regs r;
+        /* --code is no longer required: instructions are read off the chip,
+         * because flash can be read while the core is held for debugging. */
+        rc = !strcmp(action, "step-into")
+                 ? tlsr_dbg_step_into(d, timeout_ms, &r, cli_log, NULL)
+             : !strcmp(action, "step-over")
+                 ? tlsr_dbg_step_over(d, timeout_ms, &r, cli_log, NULL)
+                 : tlsr_dbg_step_out(d, timeout_ms, &r, cli_log, NULL);
+        if (rc != TLSR_OK) { rc = fail(action); goto done; }
+        print_regs(&r);
         rc = 0;
     }
     else if (!strcmp(action, "bp")) {
-        int arm = strcmp(bp_s, "off") != 0;
         uint32_t bp = 0;
-        dbg_note();
-        if (arm && parse_num(bp_s, &bp)) {
-            fprintf(stderr, "%s: --bp wants an address or 'off', not '%s'\n",
-                    PROG, bp_s);
+        if (!strcmp(bp_s, "off") || !strcmp(bp_s, "clear")) {
+            rc = tlsr_dbg_bp_clear_all(d) == TLSR_OK ? 0 : fail("bp");
+            if (!rc) printf("all breakpoints cleared\n");
+        } else if (!strcmp(bp_s, "list")) {
+            uint32_t list[TLSR_DBG_NBP];
+            int n = tlsr_dbg_bp_list(d, list, TLSR_DBG_NBP), i;
+            printf("%d of %d breakpoints set\n", n, TLSR_DBG_NBP);
+            for (i = 0; i < n; i++)
+                printf("  [%d] 0x%06X\n", i, (unsigned)(list[i] & 0xFFFFFF));
+            rc = 0;
+        } else if (parse_num(bp_s, &bp)) {
+            fprintf(stderr, "%s: --bp wants an address, 'off' or 'list', not "
+                    "'%s'\n", PROG, bp_s);
             rc = 1; goto done;
+        } else {
+            int added = 0;
+            rc = tlsr_dbg_bp_toggle(d, bp, &added) == TLSR_OK ? 0 : fail("bp");
+            if (!rc)
+                printf(added ? "breakpoint set at 0x%06X\n"
+                             : "breakpoint removed at 0x%06X\n",
+                       (unsigned)(bp & 0xFFFFFF));
         }
-        rc = tlsr_dbg_set_bp(d, bp, arm) == TLSR_OK ? 0 : fail("bp");
-        if (!rc)
-            printf(arm ? "breakpoint armed at 0x%06X\n"
-                       : "breakpoint cleared\n", (unsigned)(bp & 0xFFFFFF));
+    }
+    else if (!strcmp(action, "dbg-power-on")) {
+        rc = tlsr_dbg_power_on(d, cli_log, NULL) == TLSR_OK
+             ? 0 : fail("dbg-power-on");
+    }
+    else if (!strcmp(action, "dbg-power-off")) {
+        rc = tlsr_dbg_power_off(d, cli_log, NULL) == TLSR_OK
+             ? 0 : fail("dbg-power-off");
+    }
+    else if (!strcmp(action, "dbg-reset")) {
+        rc = tlsr_dbg_reset(d, cli_log, NULL) == TLSR_OK ? 0 : fail("dbg-reset");
     }
     else if (!strcmp(action, "runto")) {
         tlsr_regs r;
-        dbg_note();
-        if (tlsr_dbg_set_bp(d, addr, 1) != TLSR_OK) { rc = fail("bp"); goto done; }
         printf("running to 0x%06X (up to %u ms) ...\n",
                (unsigned)(addr & 0xFFFFFF), (unsigned)timeout_ms);
-        rc = tlsr_dbg_go_and_wait(d, addr, timeout_ms, &r, cli_log, NULL);
+        rc = tlsr_dbg_run_to(d, addr, timeout_ms, &r, cli_log, NULL);
         if (rc == TLSR_OK)
             print_regs(&r);
         rc = (rc == TLSR_OK) ? 0 : 1;
+    }
+    else if (!strcmp(action, "stack")) {
+        tlsr_regs r;
+        uint8_t *buf;
+        uint32_t n = steps;
+        if (tlsr_dbg_read_regs(d, &r) != TLSR_OK) { rc = fail("regs"); goto done; }
+        if (!r.full) {
+            fprintf(stderr, "%s: SP is only latched at a breakpoint. Use\n"
+                    "  --runto ADDR to stop somewhere first.\n", PROG);
+            rc = 1; goto done;
+        }
+        buf = (uint8_t *)malloc(n);
+        if (!buf) { rc = 1; goto done; }
+        if (tlsr_dbg_read_stack(d, r.r[TLSR_DBG_IDX_SP], buf, n) <= 0) {
+            free(buf); rc = fail("stack"); goto done;
+        }
+        printf("stack at SP=0x%08X\n", (unsigned)r.r[TLSR_DBG_IDX_SP]);
+        for (i = 0; (uint32_t)i < n; i += 4)
+            printf("  %08X  %02X %02X %02X %02X   0x%08X\n",
+                   (unsigned)(r.r[TLSR_DBG_IDX_SP] + (uint32_t)i),
+                   buf[i], buf[i+1], buf[i+2], buf[i+3],
+                   (unsigned)(buf[i] | (buf[i+1] << 8) |
+                              (buf[i+2] << 16) | ((uint32_t)buf[i+3] << 24)));
+        free(buf);
+        rc = 0;
+    }
+    else if (!strcmp(action, "profile")) {
+        uint32_t *hits = (uint32_t *)malloc(steps * sizeof(uint32_t));
+        int got, j, k;
+        if (!hits) { rc = 1; goto done; }
+        got = tlsr_dbg_profile(d, hits, (int)steps, 2);
+        printf("%d PC sample(s)\n", got);
+        /* Count repeats without sorting: the interesting output is which few
+         * addresses dominate, and the sample count is small. */
+        for (j = 0; j < got; j++) {
+            int n = 0, seen_before = 0;
+            for (k = 0; k < j; k++) if (hits[k] == hits[j]) seen_before = 1;
+            if (seen_before) continue;
+            for (k = 0; k < got; k++) if (hits[k] == hits[j]) n++;
+            if (n > 1 || got <= 24)
+                printf("  0x%06X  %4d  %5.1f%%\n",
+                       (unsigned)(hits[j] & 0xFFFFFF), n, 100.0 * n / got);
+        }
+        free(hits);
+        rc = 0;
     }
     else if (!strcmp(action, "read")) {
         uint8_t *buf;

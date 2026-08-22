@@ -29,6 +29,7 @@
 
 #include "tlsr_core.h"
 #include "tlsr_debug.h"
+#include "tlsr_dis.h"
 #include "res.h"
 #include "version.h"
 
@@ -73,7 +74,10 @@ enum {
     IDC_D_CONTINUE = 1500, IDC_D_PAUSE, IDC_D_STOP, IDC_D_RESTART,
     IDC_D_STEPINTO, IDC_D_STEPOVER, IDC_D_STEPOUT, IDC_D_STEPINST,
     IDC_D_RUNCUR, IDC_D_BPTOGGLE, IDC_D_BPCLEAR, IDC_D_REFRESH,
-    IDC_D_ADDR, IDC_D_ADDRLBL, IDC_D_STATE, IDC_D_REGS, IDC_D_NOTE
+    IDC_D_ADDR, IDC_D_ADDRLBL, IDC_D_STATE, IDC_D_REGS, IDC_D_NOTE,
+    IDC_D_STACK, IDC_D_CODE, IDC_D_STACKLBL,
+    IDC_D_DBGSTATE, IDC_D_CHIPSTATE, IDC_D_DISASM, IDC_D_SYMS,
+    IDC_D_ATTACH
 };
 
 /* How long a run-to-breakpoint waits before giving up and saying the core is
@@ -127,21 +131,140 @@ static HWND      g_tip;                    /* shared tooltip control          */
  * rails change.  Owned for the life of the process, so they are never freed. */
 static HICON     g_ico_pwr_on, g_ico_pwr_off;
 static tlsr_regs g_dbg;                    /* .valid says the read worked     */
-static int       g_dbg_halted;
-static int       g_dbg_bp_armed;
-static uint32_t  g_dbg_bp_addr;
 
-/* Measured on outlet #1, 2026-08-09 (see debugger/PROTOCOL.md "BENCH RESULT").
- * On TLSR8253 the CPU debug block does not answer: 0x0680 reads as all zeros,
- * 0x06BC reads zero, and 0x0602 <- 0x06 does not stall the core.  Anything that
- * needs a readable PC therefore cannot work, so those buttons start disabled.
- * They switch on by themselves if a register read ever returns real content --
- * that way a future firmware or entry sequence needs no code change here. */
-static int       g_dbg_hw_ok;
+/*
+ * What the target can do right now, measured rather than assumed.  An earlier
+ * version kept a single "the debug block answers" flag and greyed the whole
+ * toolbar out on a 2026-08-09 bench result.  That result was wrong: it probed
+ * with the core in the 0x05 flash-safe stop, where the debug unit has nothing
+ * latched.  Re-measured properly the block works, but what it will tell you
+ * depends on the state -- the PC is readable whenever the firmware runs, while
+ * sp/lr/psr only latch when the core stops at a breakpoint.
+ *
+ * So the toolbar is driven by capability bits from tlsr_dbg_status_read(), and
+ * every button turns itself on the moment the target reaches a state that
+ * supports it.  Nothing here hard-codes a verdict about the chip.
+ */
+static tlsr_dbg_status g_dbgst;
 
-static const int g_dbg_needs_pc[] = {
-    IDC_D_PAUSE, IDC_D_STEPINTO, IDC_D_STEPOVER, IDC_D_STEPOUT, IDC_D_STEPINST,
-    IDC_D_RUNCUR, IDC_D_BPTOGGLE, IDC_D_BPCLEAR, 0
+/* Stack bytes for the Debugger tab, fetched by the worker and rendered by the
+ * UI thread. Never read the target from the UI thread -- see show_stack(). */
+static uint8_t  g_stack[128];
+static uint32_t g_stack_sp;
+static int      g_stack_valid;
+
+/*
+ * Disassembly view.
+ *
+ * The code bytes come off the target itself, not from a file: flash can be read
+ * while the core is held for debugging, as long as the read does not issue its
+ * own 0x05 stop (that would end the session). tlsr_flash_read_nohalt() exists
+ * for exactly this. Reads are done in 512-byte pieces because larger ones
+ * corrupt at the doubled SWire divider -- measured, 1 KB came back with 238
+ * wrong bytes and knocked the core loose.
+ *
+ * The list is a VIRTUAL list (LVS_OWNERDATA). That is what makes scrolling
+ * seamless: rows are supplied on demand, so growing the decoded span at either
+ * end never rebuilds anything the user is looking at. An earlier version
+ * re-populated the whole control on every extension, which threw the view to a
+ * random address the moment you scrolled to the top.
+ *
+ * Rows are instructions, plus a header row wherever a symbol starts -- the
+ * layout objdump uses:
+ *
+ *      00011274 <flash_read_page>:
+ *        011274   tpush {lr}
+ *
+ * Everything here is filled in by the worker; the UI thread only reads it.
+ */
+#define DIS_CHUNK     512u          /* the largest read that stays correct    */
+#define DIS_CACHE   (64u * 1024u)   /* most code we keep decoded at once      */
+#define DIS_GROW     2048u          /* how much to add when scrolling off an end */
+#define DIS_FIRST    4096u          /* the span fetched when the core stops    */
+#define DIS_BEHIND   1024u          /* how much of that sits before the PC     */
+#define DIS_MAXROWS  40000
+
+typedef struct { uint32_t addr; int is_sym; } dis_row;
+
+static uint8_t  g_dis_code[DIS_CACHE];
+static uint32_t g_dis_lo, g_dis_hi;      /* code cached for [lo, hi)          */
+static dis_row  g_dis_row[DIS_MAXROWS];
+static int      g_dis_rows;
+static int      g_dis_valid;
+static int      g_dis_prepended;         /* rows added at the top last time   */
+static int      g_dis_busy;              /* an extend job is already queued   */
+static uint32_t g_dis_pc;                /* PC the rows were built for        */
+
+/* Symbols, sorted by address. Loaded from a file the user picks: either
+ * tc32-elf-nm output or plain "address name" lines. */
+typedef struct { uint32_t addr; char name[56]; } dis_sym;
+#define DIS_MAXSYMS 8000
+static dis_sym  g_sym[DIS_MAXSYMS];
+static int      g_nsym;
+static char     g_sym_path[MAX_PATH];
+
+/* Exact-match lookup: a symbol row is only emitted where one actually starts. */
+static const char *sym_at(uint32_t addr)
+{
+    int lo = 0, hi = g_nsym - 1;
+    while (lo <= hi) {
+        int m = (lo + hi) / 2;
+        if (g_sym[m].addr == addr) return g_sym[m].name;
+        if (g_sym[m].addr < addr) lo = m + 1; else hi = m - 1;
+    }
+    return NULL;
+}
+
+/* The symbol covering an address, for the status line. */
+static const char *sym_for(uint32_t addr, uint32_t *off)
+{
+    int lo = 0, hi = g_nsym - 1, best = -1;
+    while (lo <= hi) {
+        int m = (lo + hi) / 2;
+        if (g_sym[m].addr <= addr) { best = m; lo = m + 1; } else hi = m - 1;
+    }
+    if (best < 0) return NULL;
+    if (off) *off = addr - g_sym[best].addr;
+    return g_sym[best].name;
+}
+
+static int sym_cmp(const void *a, const void *b)
+{
+    uint32_t x = ((const dis_sym *)a)->addr, y = ((const dis_sym *)b)->addr;
+    return (x > y) - (x < y);
+}
+
+/* The image the user flashed, kept so the synthesised step actions can work
+ * out where the next instruction is.  Owned for the life of the process. */
+static uint8_t  *g_code;
+static uint32_t  g_code_len;
+static char      g_code_name[MAX_PATH];
+
+/*
+ * Buttons and the capability each one needs.
+ *
+ * Every entry names a real bit, and the bits come from tlsr_dbg_status_read(),
+ * which measures the target rather than guessing. Nothing is "always on": an
+ * earlier version gave Attach, Detach and Refresh a zero cap meaning "enabled
+ * whenever a bridge is open", and the result was a Detach button offered with
+ * no session to detach from -- a button that implies either that the core can
+ * be stopped or that a session can be ended, when neither is true.
+ */
+static const struct { int id; unsigned cap; } g_dbg_btns[] = {
+    { IDC_D_ATTACH,   TLSR_CAP_ATTACH     },
+    { IDC_D_STOP,     TLSR_CAP_DETACH     },  /* end the session               */
+    { IDC_D_RESTART,  TLSR_CAP_RESET      },  /* reboot the core               */
+    { IDC_D_CONTINUE, TLSR_CAP_RESUME     },
+    { IDC_D_PAUSE,    TLSR_CAP_HALT       },
+    { IDC_D_STEPINTO, TLSR_CAP_STEP_INTO  },
+    { IDC_D_STEPOVER, TLSR_CAP_STEP_OVER  },
+    { IDC_D_STEPOUT,  TLSR_CAP_STEP_OUT   },
+    { IDC_D_RUNCUR,   TLSR_CAP_RUN_TO     },
+    { IDC_D_BPTOGGLE, TLSR_CAP_BREAKPOINT },
+    { IDC_D_BPCLEAR,  TLSR_CAP_BREAKPOINT },
+    { IDC_D_STEPINST, TLSR_CAP_STEP_INSN  },
+    { IDC_D_REFRESH,  TLSR_CAP_MEM_READ   },
+    { 0, 0 }
 };
 
 /* A job is a function plus a copy of whatever parameters it needs; copying
@@ -779,65 +902,250 @@ static void show_info(void)
 }
 
 /* ------------------------------------------------------ register display -- */
+/* What to tell the user when a button is off.  The point of the state machine
+ * is that "unavailable" always comes with the next thing to do. */
+static const char *dbg_hint(void)
+{
+    static char buf[240];
+
+    switch (g_dbgst.state) {
+    case TLSR_DBG_NO_TARGET:
+        return "The target is powered but nothing is answering.  Switch target "
+               "power off and on again from the button in the top bar.";
+    case TLSR_DBG_POWER_OFF:
+        return "The target has no power.  Use the power button in the top bar: "
+               "it powers up WITHOUT activating, so the firmware boots and "
+               "runs - which is the only state worth debugging.";
+    case TLSR_DBG_ON_BOOT:
+        return "The target is powered and running its own firmware, and the "
+               "debugger is detached.  Press Attach (the leftmost button) to "
+               "open a session; nothing else can act on the chip until then.";
+    case TLSR_DBG_BOOT_HELD:
+        return "Caught before the firmware ran - good for flashing, useless "
+               "for debugging.  Press Attach: it will cold-cycle the target "
+               "without activating so the firmware actually runs.";
+    case TLSR_DBG_RUNNING:
+        return "Firmware is running.  Pause stops it; Restart reboots it; Stop "
+               "ends the session.  Stepping and breakpoints need the core "
+               "stopped first.";
+    case TLSR_DBG_HELD:
+    case TLSR_DBG_AT_BREAKPOINT:
+        snprintf(buf, sizeof buf,
+                 "Core stopped%s.  Registers and stack are live, stepping and "
+                 "run-to-cursor work, and %d of %d breakpoints are set.  "
+                 "Double-click a line in the listing to breakpoint it.",
+                 g_dbgst.state == TLSR_DBG_AT_BREAKPOINT
+                     ? " on a breakpoint" : "",
+                 g_dbgst.nbp, TLSR_DBG_NBP);
+        return buf;
+    }
+    return "";
+}
+
+/* Two one-glance answers next to the toolbar. They deliberately report
+ * different things: "Debugger" is whether a session is open (the bridge is on
+ * the live divider and the firmware has booted), "Chip" is whether the CPU is
+ * currently executing. You can be attached with the chip halted, which is the
+ * normal state to inspect anything in. */
+static void dbg_update_state_labels(void)
+{
+    const char *chip;
+    char buf[64];
+
+    switch (g_dbgst.state) {
+    case TLSR_DBG_POWER_OFF:     chip = "off";      break;
+    case TLSR_DBG_ON_BOOT:
+    case TLSR_DBG_RUNNING:       chip = "running";  break;
+    case TLSR_DBG_HELD:
+    case TLSR_DBG_AT_BREAKPOINT:
+    case TLSR_DBG_BOOT_HELD:     chip = "halted";   break;
+    default:
+        /* Nothing answered, so neither "running" nor "halted" would be a
+         * measurement -- say so instead of picking one. */
+        chip = "unknown";
+        break;
+    }
+    snprintf(buf, sizeof buf, "Debugger: %s",
+             g_dbgst.attached ? "attached" : "detached");
+    set_text(IDC_D_DBGSTATE, buf);
+    snprintf(buf, sizeof buf, "Chip: %s", chip);
+    set_text(IDC_D_CHIPSTATE, buf);
+}
+
 static void dbg_update_enable(void)
 {
     int i;
-    for (i = 0; g_dbg_needs_pc[i]; i++)
-        EnableWindow(GetDlgItem(g_main, g_dbg_needs_pc[i]), g_dbg_hw_ok);
-    SetWindowTextA(GetDlgItem(g_main, IDC_D_NOTE), g_dbg_hw_ok
-        ? "Debug block is answering - stepping and breakpoints enabled."
-        : "No CPU debug block on this chip (0x0680 and 0x06BC read zero) - "
-          "stepping and breakpoints disabled.  See the log.");
+    for (i = 0; g_dbg_btns[i].id; i++) {
+        /* Measured, never assumed: the bit has to be in the last status read,
+         * and the bridge has to be open for any of it to mean anything. */
+        int on = g_dev && (g_dbgst.caps & g_dbg_btns[i].cap) != 0;
+        EnableWindow(GetDlgItem(g_main, g_dbg_btns[i].id), on);
+    }
+    EnableWindow(GetDlgItem(g_main, IDC_D_CODE), TRUE);
+    SetWindowTextA(GetDlgItem(g_main, IDC_D_NOTE), dbg_hint());
+    dbg_update_state_labels();
+}
+
+/*
+ * Render only -- the bytes are fetched by the worker in dbg_sync().
+ *
+ * This function used to call tlsr_dbg_read_stack() itself, which runs on the UI
+ * thread. The bridge is not thread safe and this whole application is built
+ * around one worker touching it at a time; two threads interleaving SWire
+ * frames corrupts the exchange. The visible symptom was a breakpoint that had
+ * just been armed reading back as not armed, and it very likely explains the
+ * link instability seen while the GUI was open.
+ */
+/* A virtual list only needs its count set; the rows themselves arrive through
+ * LVN_GETDISPINFO. Nothing is inserted or deleted, so the view never jumps. */
+static void show_disasm(void)
+{
+    HWND lv = GetDlgItem(g_main, IDC_D_DISASM);
+    int i, pcrow = -1;
+
+    if (!g_dis_valid) {
+        ListView_SetItemCountEx(lv, 0, LVSICF_NOSCROLL);
+        InvalidateRect(lv, NULL, TRUE);
+        return;
+    }
+    ListView_SetItemCountEx(lv, g_dis_rows, LVSICF_NOINVALIDATEALL | LVSICF_NOSCROLL);
+
+    if (g_dis_prepended > 0) {
+        /* Rows appeared above what the user was looking at. Scroll down by
+         * exactly that many so the same instruction stays under the cursor --
+         * this is the whole point of extending rather than rebuilding. */
+        RECT r;
+        int rowh = 16;
+        if (ListView_GetItemRect(lv, 0, &r, LVIR_BOUNDS))
+            rowh = r.bottom - r.top;
+        if (rowh < 4) rowh = 16;
+        ListView_Scroll(lv, 0, g_dis_prepended * rowh);
+        g_dis_prepended = 0;
+        InvalidateRect(lv, NULL, FALSE);
+        return;                       /* deliberately do not re-centre on the PC */
+    }
+
+    for (i = 0; i < g_dis_rows; i++)
+        if (!g_dis_row[i].is_sym && g_dis_row[i].addr == g_dis_pc) { pcrow = i; break; }
+    if (pcrow >= 0) {
+        int per = ListView_GetCountPerPage(lv);
+        int top = pcrow - (per > 6 ? per / 3 : 1);
+        if (top < 0) top = 0;
+        ListView_EnsureVisible(lv, g_dis_rows - 1, FALSE);
+        ListView_EnsureVisible(lv, top, FALSE);
+        ListView_EnsureVisible(lv, pcrow, FALSE);
+        /* Move the selection with the PC. Left where it was, it would keep
+         * highlighting whatever row index it held, which after a re-centre is
+         * a different instruction entirely. */
+        ListView_SetItemState(lv, -1, 0, LVIS_SELECTED);
+        ListView_SetItemState(lv, pcrow, LVIS_SELECTED, LVIS_SELECTED);
+    }
+    InvalidateRect(lv, NULL, FALSE);
+}
+
+static void show_stack(void)
+{
+    HWND lv = GetDlgItem(g_main, IDC_D_STACK);
+    const uint8_t *buf = g_stack;
+    char a[24], v[24];
+    uint32_t sp = g_stack_sp;
+    int i, row = 0;
+
+    ListView_DeleteAllItems(lv);
+    if (!g_stack_valid)
+        return;
+    for (i = 0; i < (int)sizeof g_stack; i += 4) {
+        uint32_t w = (uint32_t)buf[i] | ((uint32_t)buf[i+1] << 8) |
+                     ((uint32_t)buf[i+2] << 16) | ((uint32_t)buf[i+3] << 24);
+        snprintf(a, sizeof a, "0x%08X", (unsigned)(sp + (uint32_t)i));
+        snprintf(v, sizeof v, "0x%08X", (unsigned)w);
+        lv_row(lv, row++, a, v, i ? "" : "<- SP");
+    }
 }
 
 static void show_regs(void)
 {
     HWND lv = GetDlgItem(g_main, IDC_D_REGS);
     HWND st = GetDlgItem(g_main, IDC_D_STATE);
-    char hex[24], dec[24], line[96];
+    char hex[24], dec[24], line[200];
     int i;
 
-    /* Any real content in r0..psr means the block answered after all; light the
-     * dependent buttons up rather than keeping them off on yesterday's finding. */
-    if (g_dbg.valid && !g_dbg_hw_ok) {
-        for (i = 0; i <= TLSR_DBG_IDX_PSR; i++)
-            if (g_dbg.r[i]) { g_dbg_hw_ok = 1; break; }
-        if (g_dbg_hw_ok) {
-            ui_log("debug block returned real register content - enabling "
-                   "stepping and breakpoints");
-            dbg_update_enable();
+    dbg_update_enable();
+
+    ListView_DeleteAllItems(lv);
+    if (g_dbg.valid) {
+        for (i = 0; i < TLSR_DBG_NNAMED; i++) {
+            snprintf(hex, sizeof hex, "0x%08X", (unsigned)g_dbg.r[i]);
+            snprintf(dec, sizeof dec, "%d", (int)g_dbg.r[i]);
+            /* Saying which values are stale beats printing three zeros as if
+             * they were a reading. */
+            lv_row(lv, i, tlsr_dbg_reg_name(i), hex,
+                   (!g_dbg.full && i != TLSR_DBG_IDX_PC)
+                   ? "not latched - stop at a breakpoint" : dec);
+        }
+        snprintf(hex, sizeof hex, "0x%08X", (unsigned)g_dbg.r[TLSR_DBG_IDX_M64]);
+        lv_row(lv, TLSR_DBG_NNAMED, tlsr_dbg_reg_name(TLSR_DBG_IDX_M64), hex,
+               "(mul32*32)>>32");
+    }
+
+    /* Run-to and Toggle-breakpoint act on the Address box, not on the PC. When
+     * the core comes to rest that box is usually still showing its 0x000000
+     * default, so the obvious gesture -- Pause, then Toggle -- would arm a
+     * breakpoint at address 0 and look like a bug.
+     *
+     * So the box follows the PC every time the core stops, until the user types
+     * something in it, after which it is theirs and is left alone. "Until the
+     * user types something" is decided by remembering the exact text we last
+     * wrote: if the box still says that, nobody has edited it. Comparing text
+     * rather than hooking EN_CHANGE avoids the usual trap that SetWindowText
+     * raises EN_CHANGE too, which would make our own write look like an edit. */
+    if ((g_dbgst.caps & TLSR_CAP_PC) &&
+        (g_dbgst.state == TLSR_DBG_HELD ||
+         g_dbgst.state == TLSR_DBG_AT_BREAKPOINT)) {
+        static char seeded[24];          /* what we last wrote, "" if never */
+        char cur[64], pc[24];
+        uint32_t n = 0;
+        get_text(IDC_D_ADDR, cur, sizeof cur);
+        snprintf(pc, sizeof pc, "0x%06X", (unsigned)(g_dbgst.pc & 0xFFFFFF));
+        if (!cur[0] || !strcmp(cur, seeded) ||
+            (get_num(IDC_D_ADDR, &n) == 0 && n == 0)) {
+            set_text(IDC_D_ADDR, pc);
+            lstrcpynA(seeded, pc, sizeof seeded);
         }
     }
 
-    ListView_DeleteAllItems(lv);
-    if (!g_dbg.valid) {
-        SetWindowTextA(st, g_dbg_halted ? "core halted - registers unavailable"
-                                        : "core running");
-        return;
+    {
+        /* Name the PC when a symbol table is loaded -- "in memset+0x12" is a
+         * different quality of answer from a bare address. */
+        uint32_t off = 0;
+        const char *fn = g_nsym ? sym_for(g_dbgst.pc & 0xFFFFFFu, &off) : NULL;
+        char where[80] = "";
+        if (fn) snprintf(where, sizeof where, "  <%s+0x%X>", fn, (unsigned)off);
+        snprintf(line, sizeof line, "%s   PC=0x%06X%s   %d/%d breakpoints%s",
+                 tlsr_dbg_state_name(g_dbgst.state),
+                 (unsigned)(g_dbgst.pc & 0xFFFFFF), where,
+                 g_dbgst.nbp, TLSR_DBG_NBP,
+                 g_dbgst.live_timing ? "   [live timing]" : "");
     }
-    for (i = 0; i < TLSR_DBG_NNAMED; i++) {
-        snprintf(hex, sizeof hex, "0x%08X", (unsigned)g_dbg.r[i]);
-        snprintf(dec, sizeof dec, "%d", (int)g_dbg.r[i]);
-        lv_row(lv, i, tlsr_dbg_reg_name(i), hex, dec);
-    }
-    /* The 32-word block also carries a banked/shadow set and the wide
-     * multiplier result; show the multiplier since it is the only one whose
-     * meaning is documented. */
-    snprintf(hex, sizeof hex, "0x%08X", (unsigned)g_dbg.r[TLSR_DBG_IDX_M64]);
-    lv_row(lv, TLSR_DBG_NNAMED, tlsr_dbg_reg_name(TLSR_DBG_IDX_M64), hex,
-           "(mul32*32)>>32");
-
-    snprintf(line, sizeof line, "%s   PC=0x%06X   SP=0x%06X   LR=0x%06X%s",
-             g_dbg_halted ? "halted" : "running",
-             (unsigned)(g_dbg.r[TLSR_DBG_IDX_PC] & 0xFFFFFF),
-             (unsigned)g_dbg.r[TLSR_DBG_IDX_SP],
-             (unsigned)(g_dbg.r[TLSR_DBG_IDX_LR] & 0xFFFFFF),
-             g_dbg_bp_armed ? "   [bp armed]" : "");
     SetWindowTextA(st, line);
+    show_stack();
+    show_disasm();
 }
 
 /* ------------------------------------------------------------------ jobs --- */
 static void dbg_publish(void);
+static void dbg_sync(void);
+static void dbg_load_disasm(void);
+static int  browse(char *path, int save, const char *filter);
+static void load_code_image(void);
+/* A common-dialog filter is a run of NUL-separated pairs ending in a double
+ * NUL, so it cannot be written as one plain string literal. */
+static const char SYM_FILTER[] =
+    "Symbols (nm / map / lst)\0*.txt;*.map;*.sym;*.lst\0"
+    "All files\0*.*\0";
+
+static void load_symbols(void);
+static void job_dbg_refresh(void);
 
 static void job_probe(void)
 {
@@ -850,15 +1158,29 @@ static void job_probe(void)
         ui_log("  %s, %u KB %s flash, boot marker 0x%02X",
                g_info.chip_name, (unsigned)(g_info.flash_size / 1024),
                g_info.flash_vendor, g_info.boot_marker);
-        /* Settle the Debugger tab on measurement rather than on a default:
-         * ask the chip whether the debug block answers at all. */
-        if (tlsr_dbg_present(g_dev, &g_dbg_hw_ok, core_log, NULL) != TLSR_OK)
-            g_dbg_hw_ok = 0;
     }
     PostMessageA(g_main, WM_APP + 1, 0, 0);
-    dbg_publish();
+    /* Settle the Debugger tab on measurement rather than on a default. After a
+     * probe the core is caught before the firmware ran, so this will report
+     * BOOT_HELD and offer Attach -- which is the honest answer. */
+    dbg_sync();
 }
 
+/*
+ * Target power.
+ *
+ * Powering up deliberately does NOT activate. Activation catches the chip in
+ * the post-reset window before the firmware runs, and that state survives a
+ * soft reset -- so a target powered "helpfully" that way can never be debugged
+ * without being power-cycled again. Coming up running is also the honest
+ * default: it is what the board does when you plug it in.
+ *
+ * The programmer tabs are unaffected: each of them calls tlsr_ensure_target(),
+ * which activates for itself when it needs to.
+ *
+ * The rail selector still applies to a manual power-off, but powering up for a
+ * debug session uses both rails, because that is what the firmware needs.
+ */
 static void job_power(void)
 {
     int on = g_job.flag;
@@ -868,30 +1190,46 @@ static void job_power(void)
     if      (sel == 1) r = TLSR_RAIL_PB0;
     else if (sel == 2) r = TLSR_RAIL_MOSFET;
 
-    if (tlsr_power(g_dev, on, r) != TLSR_OK)
-        ui_log("! %s", tlsr_last_error());
-    else
-        ui_log("target power %s", on ? "on" : "off");
+    if (on && r == TLSR_RAIL_BOTH) {
+        if (tlsr_dbg_power_on(g_dev, core_log, NULL) != TLSR_OK)
+            ui_log("! %s", tlsr_last_error());
+        else
+            ui_log("target powered - the firmware is booting. Press Attach "
+                   "in the Debugger tab to open a session.");
+    } else if (!on) {
+        if (tlsr_dbg_power_off(g_dev, core_log, NULL) != TLSR_OK)
+            ui_log("! %s", tlsr_last_error());
+    } else {
+        /* A single rail is an expert request from the Bridge tab; pass it
+         * through untouched rather than second-guessing it. */
+        if (tlsr_power(g_dev, on, r) != TLSR_OK)
+            ui_log("! %s", tlsr_last_error());
+        else
+            ui_log("target power on (selected rail only)");
+    }
+    dbg_sync();
 }
 
-/* Connecting opens the serial port and nothing else: the target is left in
- * whatever state it was in, because powering a board up is something the user
- * asks for, not a side effect of plugging in the bridge.  This job only reads
- * the rail state back so the header can report it honestly. */
+/*
+ * Connecting opens the serial port and puts the target in a known state: OFF.
+ *
+ * Deliberately not "leave it as it was found". A bridge that was left powering
+ * a target from a previous run comes back in a state nobody chose -- possibly
+ * activated and caught at boot, possibly mid-debug-session on the live SWire
+ * divider, and the two are indistinguishable from the outside. Starting from no
+ * power means the first thing the user does is press the power button, and
+ * exactly one thing happens: the target boots its own firmware.
+ */
 static void job_link_state(void)
 {
-    uint8_t rails = 0;
-
     if (!g_dev) { ui_log("not connected"); return; }
-    if (tlsr_get_cfg(g_dev, NULL, &rails) != TLSR_OK) {
-        ui_log("! %s", tlsr_last_error());
-        return;
-    }
-    if (rails)
-        ui_log("target power is already on - left as it was found");
+    if (tlsr_dbg_power_off(g_dev, NULL, NULL) != TLSR_OK)
+        ui_log("! could not switch target power off: %s", tlsr_last_error());
     else
-        ui_log("target is NOT powered.  It powers up on the first operation "
-               "that needs it, or from Target -> Power on / Re-probe.");
+        ui_log("target power is off.  Press the power button in the top bar "
+               "to boot the target's own firmware, then Attach in the Debugger "
+               "tab.  The programmer tabs power up for themselves.");
+    dbg_sync();
 }
 
 static void job_halt(void)
@@ -913,200 +1251,470 @@ static void job_reset(void)
 
 /* ------------------------------------------------------------ debugger --- *
  * Thin wrappers over tlsr_debug.c, which is shared with the CLI so both front
- * ends drive the block identically.  The register map is pvvx's; the bench
- * result -- that this chip does not answer it -- is in debugger/PROTOCOL.md
- * and is why most of these buttons start disabled.
+ * ends drive the block identically.  No button here decides for itself whether
+ * a feature exists: each job ends in dbg_sync(), which re-measures the target
+ * and republishes the capability bits, and dbg_update_enable() switches the
+ * toolbar from those.  That is why a control can light up mid-session -- for
+ * instance sp/lr/psr and the stack only become readable once the core has
+ * stopped at a breakpoint.
  */
-static int g_dbg_warned;
-
-static void dbg_warn_once(void)
-{
-    if (g_dbg_warned) return;
-    g_dbg_warned = 1;
-    ui_log("note: the debug registers (0x0610/0x0613/0x0680) come from pvvx "
-           "TlsrPgm; on this chip they read back zero, so expect no answer.");
-}
-
 static void dbg_publish(void) { PostMessageA(g_main, WM_APP + 2, 0, 0); }
 
-
-static int dbg_read_regs(void)
+/* Debug jobs must NOT go through need_target(): that calls tlsr_ensure_target(),
+ * which activates, and activation catches the core in the post-reset window --
+ * exactly what a debug session spends its first three seconds undoing. Having
+ * the bridge open is the only precondition here. */
+static int need_bridge(void)
 {
-    if (tlsr_dbg_read_regs(g_dev, &g_dbg) != TLSR_OK) {
-        ui_log("! register file read failed: %s", tlsr_last_error());
+    if (!g_dev) {
+        ui_log("not connected");
         return 0;
     }
     return 1;
 }
 
-static int dbg_stall(void)
+/* Fetch [lo,hi) into the cache, in pieces small enough to come back intact.
+ * Returns how many bytes actually landed, so a short read degrades the view
+ * instead of failing it -- and a half-finished bulk read is exactly what knocks
+ * the core loose. */
+static uint32_t dis_fetch(uint32_t lo, uint32_t hi, uint8_t *dst)
 {
-    if (tlsr_dbg_stall(g_dev) != TLSR_OK) {
-        ui_log("! stall failed: %s", tlsr_last_error());
-        return 0;
+    uint32_t got = 0;
+    while (lo + got < hi) {
+        uint32_t n = hi - (lo + got);
+        if (n > DIS_CHUNK) n = DIS_CHUNK;
+        if (tlsr_flash_read_nohalt(g_dev, lo + got, dst + got, n, NULL, NULL)
+            != TLSR_OK) {
+            ui_log("! code read stopped at 0x%06X: %s",
+                   (unsigned)(lo + got), tlsr_last_error());
+            /* Bring it back to rest after a bad read -- but never with the
+             * 0x06 stall, which can deadlock a core fetching from flash. */
+            tlsr_dbg_pause(g_dev, NULL, NULL, NULL);
+            Sleep(50);
+            break;
+        }
+        got += n;
     }
-    g_dbg_halted = 1;
-    return 1;
+    return got;
 }
 
-static int dbg_set_bp(uint32_t addr, int arm)
+/* Decode the whole cached span into rows, inserting a header row wherever a
+ * symbol starts. Returns how many rows precede `keep`, so the caller can shift
+ * the scroll position by exactly that much and the view does not move. */
+static int dis_build_rows(uint32_t keep)
 {
-    if (tlsr_dbg_set_bp(g_dev, addr, arm) != TLSR_OK) {
-        ui_log("! breakpoint write failed: %s", tlsr_last_error());
-        return 0;
+    uint32_t a;
+    int n = 0, before = 0;
+
+    for (a = g_dis_lo; a < g_dis_hi && n < DIS_MAXROWS - 1; ) {
+        int w;
+        if (sym_at(a)) {
+            g_dis_row[n].addr = a;
+            g_dis_row[n].is_sym = 1;
+            if (a < keep) before++;
+            n++;
+        }
+        w = tlsr_dis_len(g_dis_code, g_dis_hi - g_dis_lo, g_dis_lo, a);
+        if (w <= 0) break;
+        g_dis_row[n].addr = a;
+        g_dis_row[n].is_sym = 0;
+        if (a < keep) before++;
+        n++;
+        a += (uint32_t)w;
     }
-    g_dbg_bp_armed = arm;
-    g_dbg_bp_addr  = addr;
-    return 1;
+    g_dis_rows = n;
+    g_dis_valid = n > 0;
+    return before;
 }
 
-static int dbg_go_and_wait(uint32_t addr, unsigned ms)
+/* Build the span from scratch around the PC. Used when the core stops. */
+static void dbg_load_disasm(void)
 {
-    int hit;
+    uint32_t pc, lo, hi;
 
-    g_dbg_halted = 0;
-    hit = tlsr_dbg_go_and_wait(g_dev, addr, ms, &g_dbg, core_log, NULL)
-          == TLSR_OK;
-    g_dbg_halted = hit;
-    return hit;
+    g_dis_valid = 0;
+    g_dis_rows = 0;
+    g_dis_prepended = 0;
+    if (!(g_dbgst.caps & TLSR_CAP_PC))
+        return;
+    if (g_dbgst.state != TLSR_DBG_HELD && g_dbgst.state != TLSR_DBG_AT_BREAKPOINT)
+        return;                       /* a moving PC would just thrash this */
+
+    pc = g_dbgst.pc & 0x00FFFFFFu;
+    lo = (pc > DIS_BEHIND) ? ((pc - DIS_BEHIND) & ~1u) : 0u;
+    hi = lo + DIS_FIRST;
+    if (hi > 0x80000u) hi = 0x80000u;
+
+    g_dis_hi = lo + dis_fetch(lo, hi, g_dis_code);
+    g_dis_lo = lo;
+    if (g_dis_hi <= g_dis_lo + 64u) { g_dis_valid = 0; return; }
+    g_dis_pc = pc;
+    dis_build_rows(0);
+}
+
+/* Grow the span at one end. up != 0 extends backwards, and reports how many
+ * rows appeared above the old content so the view can be nudged down by the
+ * same amount -- that is what makes scrolling to the top seamless rather than
+ * jumping somewhere else. */
+static void dis_extend(int up)
+{
+    uint32_t keep = g_dis_lo;
+
+    if (!g_dis_valid) return;
+    if (up) {
+        uint32_t add = DIS_GROW, lo;
+        if (g_dis_lo == 0) return;
+        if (add > g_dis_lo) add = g_dis_lo;
+        lo = (g_dis_lo - add) & ~1u;
+        add = g_dis_lo - lo;
+        if (g_dis_hi - lo > DIS_CACHE) {                 /* drop from the far end */
+            uint32_t keep_len = DIS_CACHE - add;
+            g_dis_hi = g_dis_lo + keep_len;
+        }
+        memmove(g_dis_code + add, g_dis_code, g_dis_hi - g_dis_lo);
+        if (dis_fetch(lo, g_dis_lo, g_dis_code) < add) {
+            memmove(g_dis_code, g_dis_code + add, g_dis_hi - g_dis_lo);
+            return;                                       /* leave it as it was */
+        }
+        g_dis_lo = lo;
+    } else {
+        uint32_t add = DIS_GROW, hi = g_dis_hi + add;
+        if (g_dis_hi >= 0x80000u) return;
+        if (hi > 0x80000u) hi = 0x80000u;
+        if (hi - g_dis_lo > DIS_CACHE) {                  /* drop from the near end */
+            uint32_t drop = (hi - g_dis_lo) - DIS_CACHE;
+            drop = (drop + 1u) & ~1u;
+            memmove(g_dis_code, g_dis_code + drop, g_dis_hi - g_dis_lo - drop);
+            g_dis_lo += drop;
+            keep = g_dis_lo;
+        }
+        if (dis_fetch(g_dis_hi, hi, g_dis_code + (g_dis_hi - g_dis_lo)) == 0)
+            return;
+        g_dis_hi = hi;
+    }
+    g_dis_prepended = dis_build_rows(keep);
+}
+
+/* Re-measure the target and refresh everything that depends on it.  Every debug
+ * job ends with this, so the toolbar always reflects the state the last action
+ * actually left the chip in rather than the one it was aiming for. */
+/* What the last action left the core in, so drifting out of it can be noticed.
+ * The 0x06 hold is not airtight on this firmware: an interrupt can break it and
+ * the core carries on. Measured with nothing written at all, a held core stayed
+ * put only 2 times in 5 over a quarter of a second. Silently presenting stale
+ * registers from a core that has since run off would be worse than saying so. */
+static int g_dbg_expect_held;
+
+static void dbg_sync(void)
+{
+    if (tlsr_dbg_status_read(g_dev, &g_dbgst) != TLSR_OK) {
+        memset(&g_dbgst, 0, sizeof g_dbgst);
+        ui_log("! could not read target state: %s", tlsr_last_error());
+    }
+    if (g_dbgst.caps & TLSR_CAP_PC) {
+        if (tlsr_dbg_read_regs(g_dev, &g_dbg) != TLSR_OK)
+            g_dbg.valid = 0;
+    } else {
+        g_dbg.valid = 0;
+    }
+    /* Did the core escape a stop we thought we had? Catch it again and say so --
+     * the PC will have moved, and pretending otherwise would leave the user
+     * reading registers from an instruction the core left long ago.
+     *
+     * This should not happen any more: every stop is anchored on a comparator,
+     * which holds indefinitely, rather than on the leaky 0x06 stall. It is kept
+     * because "the registers on screen are stale" is the one failure that looks
+     * exactly like everything being fine. */
+    if (g_dbg_expect_held && g_dbgst.state == TLSR_DBG_RUNNING) {
+        if (tlsr_dbg_pause(g_dev, NULL, NULL, NULL) == TLSR_OK &&
+            tlsr_dbg_status_read(g_dev, &g_dbgst) == TLSR_OK &&
+            g_dbgst.state != TLSR_DBG_RUNNING) {
+            ui_log("note: the core got away and was caught again at 0x%06X, so "
+                   "the registers below are from there, not from where it "
+                   "stopped before.", (unsigned)(g_dbgst.pc & 0xFFFFFF));
+            if (g_dbgst.caps & TLSR_CAP_PC)
+                tlsr_dbg_read_regs(g_dev, &g_dbg);
+        }
+    }
+
+    /* Fetch the stack here, on the worker, so the UI thread never touches the
+     * bridge. */
+    g_stack_valid = 0;
+    if ((g_dbgst.caps & TLSR_CAP_STACK) && g_dbg.valid && g_dbg.full) {
+        g_stack_sp = g_dbg.r[TLSR_DBG_IDX_SP];
+        if (tlsr_dbg_read_stack(g_dev, g_stack_sp, g_stack, sizeof g_stack) > 0)
+            g_stack_valid = 1;
+    }
+    dbg_load_disasm();
+    dbg_publish();
+}
+
+static void job_dbg_attach(void)
+{
+    if (!need_bridge()) return;
+    g_dbg_expect_held = 0;
+    ui_log("> attaching to the running firmware");
+    if (tlsr_dbg_attach(g_dev, core_log, NULL) != TLSR_OK)
+        ui_log("! attach failed: %s", tlsr_last_error());
+    else
+        ui_log("  debug session open");
+    dbg_sync();
+}
+
+static void job_dbg_detach(void)
+{
+    if (!need_bridge()) return;
+    g_dbg_expect_held = 0;
+    ui_log("> ending the debug session");
+    if (tlsr_dbg_detach(g_dev, core_log, NULL) != TLSR_OK)
+        ui_log("! detach failed: %s", tlsr_last_error());
+    dbg_sync();
+}
+
+/* Restart: reboot the core, keeping the session. The soft reset is tried first
+ * and verified by watching the core actually execute; it does not rescue a
+ * locked-up core, so the fallback is a cold cycle without activation. */
+static void job_dbg_reset(void)
+{
+    if (!need_bridge()) return;
+    g_dbg_expect_held = 0;
+    ui_log("> restarting the firmware");
+    if (tlsr_dbg_reset(g_dev, core_log, NULL) != TLSR_OK)
+        ui_log("! restart failed: %s", tlsr_last_error());
+    dbg_sync();
 }
 
 static void job_dbg_pause(void)
 {
-    if (!need_target()) return;
-    dbg_warn_once();
-    if (dbg_stall() && dbg_read_regs())
-        ui_log("core stalled, PC=0x%06X",
-               (unsigned)(g_dbg.r[TLSR_DBG_IDX_PC] & 0xFFFFFF));
-    dbg_publish();
+    if (!need_bridge()) return;
+    g_dbg_expect_held = 1;
+    /* Never a bare stall: 0x06 takes the bus from the MSPI controller, and this
+     * firmware runs from flash, so a stall that lands mid-fetch deadlocks the
+     * core. tlsr_dbg_pause() samples the live PC of the running core instead
+     * and stops it with a comparator, which both holds and cannot wedge it. */
+    if (tlsr_dbg_pause(g_dev, &g_dbg, core_log, NULL) != TLSR_OK)
+        ui_log("! %s", tlsr_last_error());
+    dbg_sync();
+    /* 0x0602 always reads back 0x08, so report the measured state rather than
+     * what the write claimed. */
+    ui_log(g_dbgst.state == TLSR_DBG_RUNNING
+           ? "! the core is still running"
+           : "core stopped, PC=0x%06X", (unsigned)(g_dbgst.pc & 0xFFFFFF));
 }
 
 static void job_dbg_continue(void)
 {
-    if (!need_target()) return;
-    dbg_warn_once();
-    if (tlsr_dbg_go(g_dev) == TLSR_OK) {
-        g_dbg_halted = 0;
-        ui_log(g_dbg_bp_armed ? "running (breakpoint armed at 0x%06X)"
-                              : "running", (unsigned)(g_dbg_bp_addr & 0xFFFFFF));
-        ui_log("  note: with the core running, SWire reads are unreliable, and "
-               "the firmware may take the SWS pad - re-probe to get back in");
-    } else {
-        ui_log("! resume failed: %s", tlsr_last_error());
-    }
-    dbg_publish();
+    if (!need_bridge()) return;
+    g_dbg_expect_held = 0;
+    /* Resumes whether or not anything is set, and waits for a hit when
+     * something is. The core leaves a breakpoint it is stopped on by itself --
+     * measured -- so there is no step-off dance to get wrong. */
+    if (tlsr_dbg_continue(g_dev, DBG_WAIT_MS, &g_dbg, core_log, NULL) != TLSR_OK)
+        ui_log("! %s", tlsr_last_error());
+    dbg_sync();
 }
 
-static void job_dbg_stop(void)
+/* Step into/over/out all live in tlsr_debug.c, so the CLI runs exactly the same
+ * code.  They are built on the real hardware step; the instruction at the PC is
+ * read off the chip, so no image file is needed for any of them. */
+static void job_dbg_stepinsn(void)
 {
-    if (!need_target()) return;
-    if (tlsr_halt(g_dev) == TLSR_OK) {
-        g_dbg_halted = 1;
-        ui_log("core stopped (0x05 - the flash-safe halt, register file may "
-               "read back as zero in this state)");
-    } else {
-        ui_log("! stop failed: %s", tlsr_last_error());
-    }
-    dbg_publish();
+    int skipped = 0;
+
+    if (!need_bridge()) return;
+    g_dbg_expect_held = 1;
+    /* The clean step, not the raw one: this firmware interrupts constantly, and
+     * a raw step lands on the IRQ vector most of the time. The handler is run
+     * out to LR, which is where the step was heading anyway. */
+    if (tlsr_dbg_step(g_dev, &g_dbg, &skipped, core_log, NULL) != TLSR_OK)
+        ui_log("! %s", tlsr_last_error());
+    dbg_sync();
+    if (skipped)
+        ui_log("  (%d interrupt(s) were stepped past to stay in your code)",
+               skipped);
 }
 
-static void job_dbg_restart(void)
+static void job_dbg_stepinto(void)
 {
-    if (!need_target()) return;
-    if (tlsr_reboot(g_dev) == TLSR_OK) {
-        g_dbg_halted = 0;
-        g_dbg.valid = 0;
-        ui_log("target reset and running");
-    } else {
-        ui_log("! restart failed: %s", tlsr_last_error());
-    }
-    dbg_publish();
+    if (!need_bridge()) return;
+    g_dbg_expect_held = 1;
+    if (tlsr_dbg_step_into(g_dev, DBG_WAIT_MS, &g_dbg, core_log, NULL) != TLSR_OK)
+        ui_log("! step into: %s", tlsr_last_error());
+    dbg_sync();
 }
 
-static void job_dbg_step(void)
-{
-    if (!need_target()) return;
-    dbg_warn_once();
-    if (!g_dbg_halted && !dbg_stall()) return;
-    if (tlsr_dbg_step(g_dev) != TLSR_OK) {
-        ui_log("! step failed: %s", tlsr_last_error());
-        return;
-    }
-    if (dbg_read_regs())
-        ui_log("stepped, PC=0x%06X",
-               (unsigned)(g_dbg.r[TLSR_DBG_IDX_PC] & 0xFFFFFF));
-    dbg_publish();
-}
-
-/* Step over and step out both live in tlsr_debug.c, so the CLI runs exactly
- * the same heuristic.  Their bookkeeping here is only what the window needs:
- * whether the core ended up held, and whether a breakpoint is still armed. */
 static void job_dbg_stepover(void)
 {
-    if (!need_target()) return;
-    dbg_warn_once();
-    if (tlsr_dbg_step_over(g_dev, DBG_WAIT_MS, &g_dbg, core_log, NULL)
-        != TLSR_OK)
+    if (!need_bridge()) return;
+    g_dbg_expect_held = 1;
+    if (tlsr_dbg_step_over(g_dev, DBG_WAIT_MS, &g_dbg, core_log, NULL) != TLSR_OK)
         ui_log("! step over: %s", tlsr_last_error());
-    else
-        g_dbg_halted = 1;
-    dbg_publish();
+    dbg_sync();
 }
 
 static void job_dbg_stepout(void)
 {
-    if (!need_target()) return;
-    dbg_warn_once();
-    if (tlsr_dbg_step_out(g_dev, DBG_WAIT_MS, &g_dbg, core_log, NULL)
-        != TLSR_OK)
+    if (!need_bridge()) return;
+    g_dbg_expect_held = 1;
+    if (tlsr_dbg_step_out(g_dev, DBG_WAIT_MS, &g_dbg, core_log, NULL) != TLSR_OK)
         ui_log("! step out: %s", tlsr_last_error());
-    else
-        g_dbg_halted = 1;
-    dbg_publish();
+    dbg_sync();
 }
 
 static void job_dbg_runcur(void)
 {
-    if (!need_target()) return;
-    dbg_warn_once();
+    if (!need_bridge()) return;
+    g_dbg_expect_held = 1;
     ui_log("running to 0x%06X", (unsigned)(g_job.addr & 0xFFFFFF));
-    if (dbg_set_bp(g_job.addr, 1))
-        dbg_go_and_wait(g_job.addr, DBG_WAIT_MS);
-    dbg_publish();
+    if (tlsr_dbg_run_to(g_dev, g_job.addr, DBG_WAIT_MS, &g_dbg, core_log, NULL)
+        != TLSR_OK)
+        ui_log("! %s", tlsr_last_error());
+    dbg_sync();
 }
 
 static void job_dbg_bptoggle(void)
 {
-    int arm;
+    int added = 0;
 
-    if (!need_target()) return;
-    dbg_warn_once();
-    arm = !(g_dbg_bp_armed && g_dbg_bp_addr == g_job.addr);
-    if (dbg_set_bp(g_job.addr, arm))
-        ui_log(arm ? "breakpoint armed at 0x%06X"
-                   : "breakpoint cleared at 0x%06X",
+    if (!need_bridge()) return;
+    if (tlsr_dbg_bp_toggle(g_dev, g_job.addr, &added) != TLSR_OK)
+        ui_log("! %s", tlsr_last_error());
+    else {
+        ui_log(added ? "breakpoint set at 0x%06X"
+                     : "breakpoint removed at 0x%06X",
                (unsigned)(g_job.addr & 0xFFFFFF));
-    dbg_publish();
+    }
+    dbg_sync();
 }
 
 static void job_dbg_bpclear(void)
 {
-    if (!need_target()) return;
-    if (dbg_set_bp(0, 0))
-        ui_log("breakpoint block cleared");
+    if (!need_bridge()) return;
+    if (tlsr_dbg_bp_clear_all(g_dev) == TLSR_OK)
+        ui_log("all breakpoints removed");
+    dbg_sync();
+}
+
+/* Grow the decoded span at one end. Submitted when the view is scrolled off an
+ * edge; the extension is spliced onto the existing rows, so the list is never
+ * rebuilt under the user. */
+static int g_dis_dir;
+
+static void job_dbg_disasm_extend(void)
+{
+    if (!need_bridge()) { g_dis_busy = 0; return; }
+    dis_extend(g_dis_dir);
+    g_dis_busy = 0;
     dbg_publish();
 }
 
+/* A soft refresh: re-measure and re-read, without changing the run state.
+ * Reading the halted flag, the PC and the register file are all passive, so a
+ * running core keeps running and a stopped one stays where it is. */
 static void job_dbg_refresh(void)
 {
-    if (!need_target()) return;
-    dbg_warn_once();
-    if (dbg_read_regs())
-        ui_log("register file read, PC=0x%06X SP=0x%06X LR=0x%06X",
-               (unsigned)(g_dbg.r[TLSR_DBG_IDX_PC] & 0xFFFFFF),
-               (unsigned)g_dbg.r[TLSR_DBG_IDX_SP],
-               (unsigned)(g_dbg.r[TLSR_DBG_IDX_LR] & 0xFFFFFF));
-    dbg_publish();
+    if (!need_bridge()) return;
+    dbg_sync();
+    ui_log("state: %s, PC=0x%06X, core %s, %d/%d breakpoints",
+           tlsr_dbg_state_name(g_dbgst.state),
+           (unsigned)(g_dbgst.pc & 0xFFFFFF),
+           g_dbgst.halted ? "stopped" : "running",
+           g_dbgst.nbp, TLSR_DBG_NBP);
+}
+
+/* Load a symbol table so the listing can show function names.
+ *
+ * Accepts tc32-elf-nm output ("0001127c T flash_read_page") and the plainer
+ * "address name" that most other tools emit. Telink's own BDT does the same
+ * thing from a .lst file, which is where the idea comes from. */
+/* Parse a symbol file. Split from the file dialog so the command line can use
+ * it too -- and so it can be exercised without driving a modal dialog. */
+static int read_symbols(const char *path)
+{
+    char line[256];
+    FILE *f;
+    int n = 0;
+
+    f = fopen(path, "r");
+    if (!f) return -1;
+
+    while (n < DIS_MAXSYMS && fgets(line, sizeof line, f)) {
+        unsigned long a;
+        char t1[80], t2[80];
+        char *p = line;
+        while (*p == ' ' || *p == '	') p++;
+        if (*p == '#' || *p == ';' || *p == 0 || *p == 10) continue;
+        /* "<addr> <type> <name>" or "<addr> <name>" */
+        if (sscanf(p, "%lx %79s %79s", &a, t1, t2) == 3 && strlen(t1) == 1) {
+            lstrcpynA(g_sym[n].name, t2, sizeof g_sym[n].name);
+        } else if (sscanf(p, "%lx %79s", &a, t1) == 2) {
+            lstrcpynA(g_sym[n].name, t1, sizeof g_sym[n].name);
+        } else {
+            continue;
+        }
+        if (a > 0xFFFFFFul) continue;             /* code space only */
+        g_sym[n].addr = (uint32_t)a & ~1u;        /* nm sets bit0 on thumb */
+        n++;
+    }
+    fclose(f);
+    g_nsym = n;
+    qsort(g_sym, (size_t)g_nsym, sizeof g_sym[0], sym_cmp);
+    lstrcpynA(g_sym_path, path, sizeof g_sym_path);
+    return n;
+}
+
+static void load_symbols(void)
+{
+    char path[MAX_PATH] = "";
+    int n;
+
+    if (!browse(path, 0, SYM_FILTER))
+        return;
+    n = read_symbols(path);
+    if (n < 0) { ui_log("! cannot open %s", path); return; }
+    ui_log("%d symbol(s) loaded from %s", n, path);
+    if (g_dev && g_dis_valid) submit(job_dbg_refresh);
+    else InvalidateRect(GetDlgItem(g_main, IDC_D_DISASM), NULL, TRUE);
+}
+
+/* Load the image that was flashed.  Step into and step over need it: without a
+ * hardware single-step they have to work out where control goes next, and that
+ * means knowing how long the instruction at the PC is.  Flash cannot be read
+ * while the core is held -- that needs the 0x05 stop, which would end the debug
+ * session -- so the bytes have to come from the host. */
+static void load_code_image(void)
+{
+    char path[MAX_PATH] = "";
+    FILE *f;
+    long n;
+    uint8_t *buf;
+
+    if (!browse(path, 0, "Firmware image (*.bin)\0*.bin\0All files\0*.*\0\0"))
+        return;
+    f = fopen(path, "rb");
+    if (!f) { ui_log("! cannot open %s", path); return; }
+    fseek(f, 0, SEEK_END); n = ftell(f); fseek(f, 0, SEEK_SET);
+    if (n <= 0) { fclose(f); ui_log("! %s is empty", path); return; }
+    buf = (uint8_t *)malloc((size_t)n);
+    if (!buf) { fclose(f); ui_log("! out of memory"); return; }
+    if (fread(buf, 1, (size_t)n, f) != (size_t)n) {
+        free(buf); fclose(f); ui_log("! short read from %s", path); return;
+    }
+    fclose(f);
+
+    free(g_code);
+    g_code = buf;
+    g_code_len = (uint32_t)n;
+    lstrcpynA(g_code_name, path, sizeof g_code_name);
+    if (g_dev)
+        tlsr_dbg_set_code(g_dev, g_code, g_code_len, 0);
+    ui_log("code image loaded: %s (%u bytes) - Step into and Step over are "
+           "available once the core is stopped at a breakpoint",
+           path, (unsigned)g_code_len);
+    if (g_dev)
+        submit(job_dbg_refresh);
+    else
+        dbg_update_enable();
 }
 
 static void job_selftest(void)
@@ -1519,10 +2127,12 @@ static const int g_tab_bridge[] = {
     IDC_B_APPLY, IDC_B_L1, IDC_B_L2, IDC_B_HINT, 0
 };
 static const int g_tab_debug[] = {
-    IDC_D_CONTINUE, IDC_D_PAUSE, IDC_D_STOP, IDC_D_RESTART,
+    IDC_D_ATTACH, IDC_D_CONTINUE, IDC_D_PAUSE, IDC_D_STOP, IDC_D_RESTART,
     IDC_D_STEPINTO, IDC_D_STEPOVER, IDC_D_STEPOUT, IDC_D_STEPINST,
     IDC_D_RUNCUR, IDC_D_BPTOGGLE, IDC_D_BPCLEAR, IDC_D_REFRESH,
-    IDC_D_ADDR, IDC_D_ADDRLBL, IDC_D_STATE, IDC_D_REGS, IDC_D_NOTE, 0
+    IDC_D_ADDR, IDC_D_ADDRLBL, IDC_D_STATE, IDC_D_REGS, IDC_D_NOTE,
+    IDC_D_STACK, IDC_D_CODE, IDC_D_DBGSTATE, IDC_D_CHIPSTATE,
+    IDC_D_DISASM, IDC_D_SYMS, 0
 };
 
 static void show_ids(const int *ids, int show)
@@ -1719,16 +2329,35 @@ static void layout(int cw, int ch)
     /* --- Debugger: the register list fills whatever is left --------------- */
     MoveWindow(GetDlgItem(g_main, IDC_D_STATE), PAGE_LEFT + 330, PAGE_TOP + 46,
                right - (PAGE_LEFT + 330), 18, TRUE);
-    MoveWindow(GetDlgItem(g_main, IDC_D_NOTE), PAGE_LEFT, PAGE_TOP + 70,
-               right - PAGE_LEFT, 18, TRUE);
+    /* IDC_D_NOTE is moved with the register pane below, so that it stops
+     * where the stack pane begins instead of running underneath it. */
     {
+        /* Disassembly on the left taking the slack; registers over stack on the
+         * right at a fixed width, since their columns hold addresses and words
+         * that do not get wider with the window. */
+        HWND dl = GetDlgItem(g_main, IDC_D_DISASM);
         HWND rl = GetDlgItem(g_main, IDC_D_REGS);
-        int h = bottom - (PAGE_TOP + 94);
-        if (h < 60) h = 60;
-        MoveWindow(rl, PAGE_LEFT, PAGE_TOP + 94, right - PAGE_LEFT, h, TRUE);
-        ListView_SetColumnWidth(rl, 2,
-                                (right - PAGE_LEFT) - 130 - 120 -
-                                GetSystemMetrics(SM_CXVSCROLL));
+        HWND sl = GetDlgItem(g_main, IDC_D_STACK);
+        const int SIDE_W = 340, GAPX = 10, GAPY = 6;
+        int h = bottom - (PAGE_TOP + 106);
+        int total = right - PAGE_LEFT;
+        int disw = total - SIDE_W - GAPX;
+        int regh, stkh;
+        if (h < 80) h = 80;
+        if (disw < 260) disw = 260;
+        regh = h / 2 - GAPY / 2;
+        if (regh < 40) regh = 40;
+        stkh = h - regh - GAPY;
+        if (stkh < 40) stkh = 40;
+
+        MoveWindow(dl, PAGE_LEFT, PAGE_TOP + 106, disw, h, TRUE);
+        ListView_SetColumnWidth(dl, 2,
+                                disw - 30 - 90 - GetSystemMetrics(SM_CXVSCROLL));
+        MoveWindow(rl, PAGE_LEFT + disw + GAPX, PAGE_TOP + 106, SIDE_W, regh, TRUE);
+        MoveWindow(sl, PAGE_LEFT + disw + GAPX, PAGE_TOP + 106 + regh + GAPY,
+                   SIDE_W, stkh, TRUE);
+        MoveWindow(GetDlgItem(g_main, IDC_D_NOTE), PAGE_LEFT, PAGE_TOP + 68,
+                   total, 32, TRUE);
     }
 
     /* Moving the tab control dirties the area the page controls occupy, so ask
@@ -1819,6 +2448,9 @@ static void do_connect(void)
     /* Deliberately NOT a probe: identifying the chip powers the target up, and
      * connecting to the bridge must not do that by itself. */
     submit(job_link_state);
+    /* Having a bridge is enough to offer Attach and Refresh, so let the
+     * Debugger toolbar notice that a connection now exists. */
+    dbg_update_enable();
 }
 
 /* ------------------------------------------------------------- PASS / FAIL -- */
@@ -2079,6 +2711,117 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l)
         LPNMHDR n = (LPNMHDR)l;
         if (n->idFrom == IDC_TABS && n->code == TCN_SELCHANGE)
             show_tab(TabCtrl_GetCurSel(g_tabs));
+        if (n->idFrom == IDC_D_DISASM) {
+            /* Our own control in our own process, so following the NMHDR
+             * pointer is fine -- the rule about not sending pointer-bearing
+             * messages applies across process boundaries. */
+            switch (n->code) {
+
+            case LVN_GETDISPINFOA: {
+                /* Rows on demand: this is what makes the list virtual, and so
+                 * what makes extending it seamless. */
+                NMLVDISPINFOA *di = (NMLVDISPINFOA *)l;
+                static char buf[160];
+                int i = di->item.iItem;
+                uint32_t a;
+                if (!(di->item.mask & LVIF_TEXT)) return 0;
+                if (i < 0 || i >= g_dis_rows) { di->item.pszText = (LPSTR)""; return 0; }
+                a = g_dis_row[i].addr;
+                buf[0] = 0;
+                if (g_dis_row[i].is_sym) {
+                    /* A symbol header, on its own line above its first
+                     * instruction -- the shape objdump uses. */
+                    if (di->item.iSubItem == 2) {
+                        const char *nm = sym_at(a);
+                        snprintf(buf, sizeof buf, "<%s>:", nm ? nm : "?");
+                    } else if (di->item.iSubItem == 1) {
+                        snprintf(buf, sizeof buf, "%08X", (unsigned)a);
+                    }
+                } else if (di->item.iSubItem == 0) {
+                    /* Every breakpoint is in the hardware the moment it is
+                     * set -- writing a comparator does not disturb a stopped
+                     * core -- so there is one marker, not two. */
+                    int b;
+                    for (b = 0; b < g_dbgst.nbp; b++)
+                        if ((g_dbgst.bp[b] & 0xFFFFFFu) == (a & 0xFFFFFFu)) {
+                            strcpy(buf, "*");
+                            break;
+                        }
+                } else if (di->item.iSubItem == 1) {
+                    /* The system paints selection over custom-draw colours, so
+                     * the PC also gets a text marker -- otherwise a selected
+                     * row and the PC row look identical. */
+                    snprintf(buf, sizeof buf, "%s%06X",
+                             a == g_dis_pc ? "> " : "  ", (unsigned)a);
+                } else if (di->item.iSubItem == 2) {
+                    if (tlsr_dis_one(g_dis_code, g_dis_hi - g_dis_lo, g_dis_lo,
+                                     a, buf, (int)sizeof buf) <= 0)
+                        strcpy(buf, "??");
+                }
+                di->item.pszText = buf;
+                return 0;
+            }
+
+            case LVN_ODCACHEHINT: {
+                /* The visible range, which is exactly the edge signal needed.
+                 * One extension at a time, and only while the core is held. */
+                NMLVCACHEHINT *ch = (NMLVCACHEHINT *)l;
+                if (g_dis_valid && !g_dis_busy && !g_busy && g_dev) {
+                    if (ch->iFrom < 24 && g_dis_lo > 0) {
+                        g_dis_dir = 1; g_dis_busy = 1;
+                        submit(job_dbg_disasm_extend);
+                    } else if (ch->iTo > g_dis_rows - 24 && g_dis_hi < 0x80000u) {
+                        g_dis_dir = 0; g_dis_busy = 1;
+                        submit(job_dbg_disasm_extend);
+                    }
+                }
+                return 0;
+            }
+
+            case NM_CUSTOMDRAW: {
+                /* Colour the PC row and the symbol headers. */
+                NMLVCUSTOMDRAW *cd = (NMLVCUSTOMDRAW *)l;
+                int i = (int)cd->nmcd.dwItemSpec;
+                if (cd->nmcd.dwDrawStage == CDDS_PREPAINT)
+                    return CDRF_NOTIFYITEMDRAW;
+                if (cd->nmcd.dwDrawStage == CDDS_ITEMPREPAINT) {
+                    if (i >= 0 && i < g_dis_rows) {
+                        if (g_dis_row[i].is_sym) {
+                            cd->clrText = RGB(0, 100, 0);
+                            cd->clrTextBk = RGB(240, 240, 240);
+                        } else if (g_dis_row[i].addr == g_dis_pc) {
+                            cd->clrText = RGB(255, 255, 255);
+                            cd->clrTextBk = RGB(0, 90, 190);
+                        }
+                    }
+                    return CDRF_NEWFONT;
+                }
+                return CDRF_DODEFAULT;
+            }
+
+            case NM_DBLCLK: {
+                /* Toggle the hardware breakpoint on this line. Only the two
+                 * affected rows are redrawn -- rebuilding the table here was
+                 * the other thing that threw the view around. */
+                int row = ((LPNMITEMACTIVATE)l)->iItem;
+                if (row >= 0 && row < g_dis_rows && g_dev &&
+                    !g_dis_row[row].is_sym &&
+                    (g_dbgst.caps & TLSR_CAP_BREAKPOINT)) {
+                    char t[24];
+                    g_job.addr = g_dis_row[row].addr;
+                    snprintf(t, sizeof t, "0x%06X", (unsigned)g_job.addr);
+                    set_text(IDC_D_ADDR, t);
+                    submit(job_dbg_bptoggle);
+                    /* Only this row is repainted now; the rest of the BP column
+                     * catches up when the worker republishes the status, which
+                     * is also when the change has actually reached the chip. */
+                    ListView_RedrawItems(n->hwndFrom, row, row);
+                }
+                return 0;
+            }
+            default: break;
+            }
+        }
         return 0;
     }
 
@@ -2165,24 +2908,53 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l)
         /* --- debugger ------------------------------------------------- */
         case IDC_D_CONTINUE: submit(job_dbg_continue); return 0;
         case IDC_D_PAUSE:    submit(job_dbg_pause);    return 0;
-        case IDC_D_STOP:     submit(job_dbg_stop);     return 0;
-        case IDC_D_RESTART:  submit(job_dbg_restart);  return 0;
-        case IDC_D_STEPINTO:
-        case IDC_D_STEPINST: submit(job_dbg_step);     return 0;
+        case IDC_D_ATTACH:   submit(job_dbg_attach);   return 0;
+        case IDC_D_STOP:     submit(job_dbg_detach);   return 0;
+        case IDC_D_RESTART:  submit(job_dbg_reset);    return 0;
+        case IDC_D_STEPINTO: submit(job_dbg_stepinto); return 0;
         case IDC_D_STEPOVER: submit(job_dbg_stepover); return 0;
         case IDC_D_STEPOUT:  submit(job_dbg_stepout);  return 0;
         case IDC_D_BPCLEAR:  submit(job_dbg_bpclear);  return 0;
         case IDC_D_REFRESH:  submit(job_dbg_refresh);  return 0;
+        case IDC_D_STEPINST: submit(job_dbg_stepinsn); return 0;
+        case IDC_D_CODE:     load_code_image();        return 0;
+        case IDC_D_SYMS:     load_symbols();           return 0;
 
-        case IDC_D_RUNCUR:
-        case IDC_D_BPTOGGLE: {
+        /*
+         * Run to cursor means the cursor. The selected row in the listing is
+         * what the user is pointing at, so that is the destination; the Address
+         * box is the fallback for when nothing is selected, and for driving the
+         * tab with no listing on screen.
+         *
+         * Toggle breakpoint acts on the PC, which is what "toggle a breakpoint
+         * here" means when the core is stopped -- double-clicking a line is the
+         * way to breakpoint somewhere else.
+         */
+        case IDC_D_RUNCUR: {
             uint32_t a = 0;
-            if (get_num(IDC_D_ADDR, &a)) {
-                ui_log("! enter an address in the Debugger address box");
+            HWND lv = GetDlgItem(g_main, IDC_D_DISASM);
+            int row = ListView_GetNextItem(lv, -1, LVNI_SELECTED);
+            if (row >= 0 && row < g_dis_rows && !g_dis_row[row].is_sym) {
+                a = g_dis_row[row].addr;
+            } else if (get_num(IDC_D_ADDR, &a)) {
+                ui_log("! select a line in the listing, or type an address in "
+                       "the Address box");
                 return 0;
             }
             g_job.addr = a;
-            submit(id == IDC_D_RUNCUR ? job_dbg_runcur : job_dbg_bptoggle);
+            submit(job_dbg_runcur);
+            return 0;
+        }
+        case IDC_D_BPTOGGLE: {
+            uint32_t a = 0;
+            if (g_dbgst.caps & TLSR_CAP_PC) {
+                a = g_dbgst.pc & 0xFFFFFFu;
+            } else if (get_num(IDC_D_ADDR, &a)) {
+                ui_log("! no PC to toggle a breakpoint on");
+                return 0;
+            }
+            g_job.addr = a;
+            submit(job_dbg_bptoggle);
             return 0;
         }
 
@@ -2340,7 +3112,31 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l)
     }
 
     case WM_CLOSE:
-        if (g_dev) tlsr_close(g_dev);
+        /*
+         * Do not walk away from an open debug session.
+         *
+         * Two things would otherwise be left behind: a core stopped on a
+         * comparator, which for anything doing a real job means it simply
+         * stops until it is power-cycled, and a bridge on the doubled SWire
+         * divider, at which the programmer path reads every byte shifted one
+         * bit and reports a confident 0xFF62 chip id. tlsr_ensure_target()
+         * repairs the second on its own, but leaving it to do so is not a
+         * reason to leave a mess.
+         *
+         * Safe on this thread only because the worker is idle: submit() refuses
+         * to queue while g_busy, and the window is going away, so nothing else
+         * can start.
+         */
+        if (g_dev) {
+            int busy;
+            EnterCriticalSection(&g_lock);
+            busy = g_busy;
+            LeaveCriticalSection(&g_lock);
+            if (!busy && tlsr_dbg_attached(g_dev))
+                tlsr_dbg_detach(g_dev, NULL, NULL);
+            tlsr_close(g_dev);
+            g_dev = NULL;
+        }
         DestroyWindow(h);
         return 0;
 
@@ -2586,48 +3382,97 @@ static void build_controls(void)
         int x = PAGE_LEFT;
         const int P = 36, G = 14;      /* button pitch, extra gap per group   */
 
-        mk_iconbtn(IDI_D_CONTINUE, x, y, IDC_D_CONTINUE,
-                   "Continue - resume the core (0x0602 <- 0x84)");      x += P;
-        mk_iconbtn(IDI_D_PAUSE, x, y, IDC_D_PAUSE,
-                   "Pause - stall the core and read its registers "
-                   "(0x0602 <- 0x06)");                                 x += P;
+        /* Attach is leftmost because in a detached session it is the only
+         * thing that can be pressed. */
+        mk_iconbtn(IDI_D_ATTACH, x, y, IDC_D_ATTACH,
+                   "Attach - open a debug session on the running firmware: "
+                   "switch the bridge to the live SWire divider and check the "
+                   "firmware is up. If the chip turns out to be caught at boot "
+                   "it is cold-cycled without activation first.");      x += P;
         mk_iconbtn(IDI_D_STOP, x, y, IDC_D_STOP,
-                   "Stop - the flash-safe halt (0x0602 <- 0x05)");      x += P;
+                   "Stop - end the debug session. Breakpoints are cleared, the "
+                   "core is left running, the target stays powered.");  x += P;
         mk_iconbtn(IDI_D_RESTART, x, y, IDC_D_RESTART,
-                   "Restart - reset and run (0x0602 <- 0x88)");   x += P + G;
+                   "Restart - reboot the core without closing the session "
+                   "(0x0602 <- 0x88). Falls back to a cold power cycle if the "
+                   "core has locked up, since a soft reset cannot rescue that.");
+                                                                  x += P + G;
+
+        mk_iconbtn(IDI_D_CONTINUE, x, y, IDC_D_CONTINUE,
+                   "Continue - let the core run until a breakpoint is hit");
+                                                                        x += P;
+        mk_iconbtn(IDI_D_PAUSE, x, y, IDC_D_PAUSE,
+                   "Pause - stop the core. Samples the live PC and stops on a "
+                   "comparator there, so the stop holds and the whole register "
+                   "file is valid.");                             x += P + G;
 
         mk_iconbtn(IDI_D_STEPINTO, x, y, IDC_D_STEPINTO,
-                   "Step into - one instruction (0x0613 <- 0x80)");     x += P;
+                   "Step into - execute the instruction at the PC. A call ends "
+                   "up on the callee's first instruction.");             x += P;
         mk_iconbtn(IDI_D_STEPOVER, x, y, IDC_D_STEPOVER,
-                   "Step over - step once, and if that entered a call, "
-                   "run to the return address");                        x += P;
+                   "Step over - as Step into, except a call is run through and "
+                   "the core stops on the instruction after it.");       x += P;
         mk_iconbtn(IDI_D_STEPOUT, x, y, IDC_D_STEPOUT,
-                   "Step out - run to the address in LR");              x += P;
+                   "To caller - run until this function returns, and stop just "
+                   "after the call that entered it (the address in LR).");
+                                                                        x += P;
         mk_iconbtn(IDI_D_STEPINST, x, y, IDC_D_STEPINST,
-                   "Step one instruction");                       x += P + G;
+                   "Step one instruction. Same as Step into on this part: "
+                   "there is no line information, so an instruction is the "
+                   "smallest step there is.");                    x += P + G;
 
         mk_iconbtn(IDI_D_RUNCUR, x, y, IDC_D_RUNCUR,
-                   "Run to the address in the box");              x += P + G;
+                   "Run to cursor - run until the selected line in the listing "
+                   "is reached, then stop there. Costs no breakpoint slot.");
+                                                                  x += P + G;
 
         mk_iconbtn(IDI_D_BPTOGGLE, x, y, IDC_D_BPTOGGLE,
-                   "Toggle a hardware breakpoint at that address "
-                   "(0x0614 <- addr | bit24)");                         x += P;
+                   "Toggle a hardware breakpoint at the PC. Double-click a "
+                   "line in the listing to breakpoint that instead. Three are "
+                   "available.");                                       x += P;
         mk_iconbtn(IDI_D_BPCLEAR, x, y, IDC_D_BPCLEAR,
-                   "Clear the breakpoint block");                 x += P + G;
+                   "Remove every breakpoint");                    x += P + G;
 
         mk_iconbtn(IDI_D_REFRESH, x, y, IDC_D_REFRESH,
-                   "Re-read the CPU register file (0x0680)");
+                   "Refresh - re-read the state, registers and stack without "
+                   "disturbing the core");
+        x += P + G;
+
+        mk_static("Debugger: detached", x, y, 170, IDC_D_DBGSTATE);
+        mk_static("Chip: unknown",      x, y + 16, 170, IDC_D_CHIPSTATE);
     }
     mk_static("Address", PAGE_LEFT, y + 46, 55, IDC_D_ADDRLBL);
     mk_edit("0x000000", PAGE_LEFT + 58, y + 42, 90, IDC_D_ADDR);
+    mk_button("Code...", PAGE_LEFT + 156, y + 42, 70, IDC_D_CODE);
+    mk_button("Symbols...", PAGE_LEFT + 232, y + 42, 90, IDC_D_SYMS);
     mk_static("", PAGE_LEFT + 330, y + 46, 400, IDC_D_STATE);
-    mk_static("", PAGE_LEFT, y + 70, 760, IDC_D_NOTE);   /* text set by
-                                                          * dbg_update_enable */
+    /* Two lines tall: this is the one place the tab explains what to do next,
+     * and at the default window width a single line clips mid-sentence. A
+     * STATIC wraps on its own once it has the room. */
+    ctl("STATIC", "", SS_LEFT, PAGE_LEFT, y + 68, 760, 32, IDC_D_NOTE);
+    /* Disassembly on the left, registers over stack on the right. The real
+     * geometry is set by the resize handler; these are just starting sizes. */
     {
-        HWND l = mk_list(PAGE_LEFT, y + 94, 770, 200, IDC_D_REGS);
-        lv_column(l, 0, "Register", 130);
-        lv_column(l, 1, "Hex", 120);
-        lv_column(l, 2, "Decimal / note", 300);
+        /* LVS_OWNERDATA: a virtual list, so rows are fetched as they are shown
+         * and the span can grow at either end without rebuilding anything. */
+        HWND l = ctl(WC_LISTVIEWA, "", LVS_REPORT | LVS_SINGLESEL | LVS_OWNERDATA |
+                     WS_BORDER, PAGE_LEFT, y + 94, 430, 200, IDC_D_DISASM);
+        ListView_SetExtendedListViewStyle(l, LVS_EX_FULLROWSELECT);
+        lv_column(l, 0, "BP", 28);
+        lv_column(l, 1, "Address", 86);
+        lv_column(l, 2, "Symbol / instruction", 300);
+    }
+    {
+        HWND l = mk_list(PAGE_LEFT + 440, y + 94, 330, 100, IDC_D_REGS);
+        lv_column(l, 0, "Register", 90);
+        lv_column(l, 1, "Hex", 100);
+        lv_column(l, 2, "Decimal / note", 220);
+    }
+    {
+        HWND l = mk_list(PAGE_LEFT + 440, y + 200, 330, 94, IDC_D_STACK);
+        lv_column(l, 0, "Stack at SP", 95);
+        lv_column(l, 1, "Word", 95);
+        lv_column(l, 2, "", 70);
     }
 
     /* --- log ----------------------------------------------------------- */
@@ -2671,7 +3516,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     MSG msg;
     HWND h;
 
-    (void)prev; (void)cmd;
+    (void)prev;
     g_inst = inst;
 
     InitializeCriticalSection(&g_lock);
@@ -2714,18 +3559,50 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     ShowWindow(h, show);
     UpdateWindow(h);
 
+    /* -s <symbols> and -c <code image> so a session can be set up without
+     * clicking through two file dialogs every time. */
+    if (cmd && *cmd) {
+        char *p = cmd;
+        while (*p) {
+            char what = 0, path[MAX_PATH]; int i = 0;
+            while (*p == ' ') p++;
+            if (p[0] == '-' && (p[1] == 's' || p[1] == 'c')) { what = p[1]; p += 2; }
+            while (*p == ' ') p++;
+            if (*p == '"') { p++; while (*p && *p != '"' && i < MAX_PATH - 1) path[i++] = *p++; if (*p) p++; }
+            else           { while (*p && *p != ' ' && i < MAX_PATH - 1) path[i++] = *p++; }
+            path[i] = 0;
+            if (!i) break;
+            if (what == 's') {
+                int n = read_symbols(path);
+                if (n < 0) ui_log("! cannot open symbols %s", path);
+                else       ui_log("%d symbol(s) loaded from %s", n, path);
+            } else if (what == 'c') {
+                lstrcpynA(g_code_name, path, sizeof g_code_name);
+                ui_log("code image argument: %s", path);
+            }
+        }
+    }
+
     ui_log("%s - connect to the bridge, then use the tabs.", APP_CAPTION);
     ui_log("The target board must be UNPLUGGED FROM MAINS if it is a mains "
            "device: such supplies are usually not isolated.");
-    ui_log("Not every debug feature exists on this hardware.  Measured on a "
-           "TLSR8253: the CPU debug block does not answer - the register file "
-           "at 0x0680 and the PC latch at 0x06BC both read back as zero, and "
-           "0x0602 <- 0x06 does not stall the core.  Single-step, breakpoints "
-           "and run-to-cursor therefore cannot work and are greyed out; "
-           "halt/resume/reset, memory, flash and the register probe are fine.");
-    ui_log("Resuming the core can also cost you the SWire link: once the target "
-           "firmware boots it may reconfigure the SWS pad as GPIO.  Recovery "
-           "is a power cycle with an activation burst (Target -> Re-probe).");
+    ui_log("The target starts with NO POWER.  The power button in the top bar "
+           "powers it up WITHOUT activating, so it boots its own firmware - "
+           "which is the only state worth debugging, because activation "
+           "catches the chip before it boots and that survives a soft reset.  "
+           "Then press Attach in the Debugger tab: it switches the bridge to "
+           "the live SWire divider, because firmware that raises the system "
+           "clock and does not rewrite SWIRE_DIV leaves the slave clocking "
+           "faster than the bridge expects, and every byte then reads back "
+           "shifted one bit.  The programmer tabs activate for themselves and "
+           "are unaffected.");
+    ui_log("Measured on a TLSR8253: pause, resume, single-step, step over, "
+           "step out, run-to-cursor, THREE hardware breakpoints, PC sampling "
+           "and memory read/write all work, and the code being executed is "
+           "read straight off the chip, so no image file is needed.  Stepping "
+           "uses Telink's own 0x0602/0x0613 sequence; a step that lands on the "
+           "IRQ vector is finished by running the handler out to LR, so "
+           "interrupt-heavy firmware still steps one instruction at a time.");
 
     while (GetMessageA(&msg, NULL, 0, 0) > 0) {
         if (!IsDialogMessageA(h, &msg)) {
