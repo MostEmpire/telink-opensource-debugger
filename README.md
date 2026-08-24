@@ -31,7 +31,7 @@ bin\programmer_cli.exe -p COM10 --dump -f backup.bin
 
 The GUI looks like this:
 
-<img width="948" height="696" alt="image" src="doc/programmer_GUI.png" />
+<img width="940" height="695" alt="image" src="https://github.com/user-attachments/assets/ec4e5938-dceb-46fa-b2c0-50949a6adfa3" />
 
 The schematic of the Blue Pill circuitry. You have two options how to wire it all up.
 The minimal one, which consists of a GND->SWS_GND, PB0->SWS_VCC, A7->\[750R\]->A6, A6->SWS_SWS
