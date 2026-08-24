@@ -84,7 +84,7 @@ installer and have to sit next to `stmcdc.inf`; they are not built here.)
 | GUI | CLI |
 |---|---|
 | Port combo, **Rescan**, **Connect** | `--list`, `-p PORT` |
-| Target -> **Re-probe** | `--info` (and `--dbg-probe`) |
+| Target -> **Re-probe** | `--info` |
 | Target -> **Power on / off**, rail selector | `--power on\|off`, `--rail` |
 | Target -> **Halt core** / **Run core** / **Reset+run** | `--halt` / `--run` / `--reset` |
 | Memory -> **Read**, region and address/length | `--read --region --addr --length` |
@@ -95,15 +95,16 @@ installer and have to sit next to `stmcdc.inf`; they are not built here.)
 | Bridge -> **Self-test** / **Pin test** | `--selftest` / `--pintest` |
 | Bridge -> **Activate**, activation frames | `--activate --frames N` |
 | Bridge -> **Refresh** / **Apply** timing | `--cfg` / `--set-cfg K=V,..` |
-| Debugger -> **Continue** / **Pause** / **Stop** / **Restart** | `--continue` / `--stall` / `--halt` / `--reset` |
-| Debugger -> **Step into**, **Step instruction** | `--step [N]` |
-| Debugger -> **Step over** / **Step out** | `--step-over` / `--step-out` |
+| Top bar -> **target power** | `--dbg-power-on` / `--dbg-power-off` |
+| Debugger -> **Attach** / **Stop** | `--dbg-attach` / `--dbg-detach` |
+| Debugger -> **Restart** | `--dbg-reset` |
+| Debugger -> **Continue** / **Pause** | `--resume` / `--halt-core` |
+| Debugger -> **Step into** / **over** / **To caller** | `--step-into` / `--step-over` / `--step-out` |
+| Debugger -> **Step instruction** | `--step [N]` |
 | Debugger -> **Run to cursor** | `--runto ADDR --timeout MS` |
-| Debugger -> **Toggle** / **Clear breakpoint** | `--bp ADDR` / `--bp off` |
-| Debugger -> **Refresh registers** | `--regs` |
-
-
-
+| Debugger -> **Toggle** / **Clear breakpoints** | `--bp ADDR` / `--bp off`, `--bp list` |
+| Debugger -> **Refresh** | `--dbg-status`, `--regs` |
+| Debugger -> **Code...** | `--code PATH` (optional -- code is read off the chip) |
 
 or start `bin\programmer_gui.exe`, pick the port and press **Connect**.
 
